@@ -17,7 +17,7 @@ PARALLEL_REQUIRE = ["ray[debug,tune]~=2.0.0"]
 PYTYPE = ["pytype==2022.7.26"] if IS_NOT_WINDOWS else []
 if IS_NOT_WINDOWS:
     # TODO(adam): use this for Windows as well once PyPI is at >=1.6.1
-    STABLE_BASELINES3 = "stable-baselines3>=1.6.0"
+    STABLE_BASELINES3 = "stable-baselines3>=1.4.0"
 else:
     STABLE_BASELINES3 = (
         "stable-baselines3@git+"
@@ -26,7 +26,7 @@ else:
 
 # pinned to 0.21 until https://github.com/DLR-RM/stable-baselines3/pull/780 goes
 # upstream.
-GYM_VERSION_SPECIFIER = "==0.21.0"
+GYM_VERSION_SPECIFIER = "==0.19"
 
 # Note: the versions of the test and doc requirements should be tightly pinned to known
 #   working versions to make our CI/CD pipeline as stable as possible.
