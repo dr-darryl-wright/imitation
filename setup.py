@@ -202,6 +202,8 @@ setup(
         #  See https://github.com/IDSIA/sacred/issues/879
         "chai-sacred>=0.8.3",
         "tensorboard>=1.14",
+        "opencv-python~=4.5.5.62",
+        "requests",
     ],
     tests_require=TESTS_REQUIRE,
     extras_require={
@@ -225,6 +227,9 @@ setup(
         "mujoco": [
             "gym[classic_control,mujoco]" + GYM_VERSION_SPECIFIER,
         ],
+        "atari": [
+            "gym[classic_control,atari]" + GYM_VERSION_SPECIFIER,
+        ]
     },
     entry_points={
         "console_scripts": [

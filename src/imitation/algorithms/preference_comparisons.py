@@ -7,6 +7,7 @@ import abc
 import math
 import pickle
 import random
+import uuid
 from typing import (
     Any,
     Callable,
@@ -20,7 +21,9 @@ from typing import (
     Union,
 )
 
+import cv2
 import numpy as np
+import requests
 import torch as th
 from scipy import special
 from stable_baselines3.common import base_class, type_aliases, utils, vec_env
@@ -752,6 +755,44 @@ class ActiveSelectionFragmenter(Fragmenter):
         return var_estimate
 
 
+class PreferenceQuerent(abc.ABC):
+    def __init__(
+        self,
+        seed: Optional[int] = None,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        """Initializes the preference gatherer.
+
+        Args:
+            seed: seed for the internal RNG, if applicable
+            custom_logger: Where to log to; if None (default), creates a new logger.
+        """
+        # The random seed isn't used here, but it's useful to have this
+        # as an argument nevertheless because that means we can always
+        # pass in a seed in training scripts (without worrying about whether
+        # the PreferenceGatherer we use needs one).
+        del seed
+        self.logger = custom_logger or imit_logger.configure()
+
+    def __call__(self, fragment_pairs: Sequence[TrajectoryWithRewPair]) -> None:
+        """Queries a teacher for their preferences.
+
+        Args:
+            fragment_pairs: sequence of pairs of trajectory fragments (the queries)
+
+        Returns:
+            None. Preferences are assumed to be answered asynchronously. 
+            
+            Note: When preferences are gathered synchronously, e.g. with the `SyntheticGatherer`,
+            use `DummyPreferenceQuerent`.  
+        """  # noqa: DAR202
+
+
+class DummyPreferenceQuerent(PreferenceQuerent):
+    def __call__(self, fragment_pairs: Sequence[TrajectoryWithRewPair]) -> None:
+        pass
+
+
 class PreferenceGatherer(abc.ABC):
     """Base class for gathering preference comparisons between trajectory fragments."""
 
@@ -774,7 +815,8 @@ class PreferenceGatherer(abc.ABC):
         self.logger = custom_logger or imit_logger.configure()
 
     @abc.abstractmethod
-    def __call__(self, fragment_pairs: Sequence[TrajectoryWithRewPair]) -> np.ndarray:
+    def __call__(self, fragment_pairs: Sequence[TrajectoryPair]) -> \
+            Tuple[Sequence[TrajectoryPair], np.ndarray]:
         """Gathers the probabilities that fragment 1 is preferred in `fragment_pairs`.
 
         Args:
@@ -832,7 +874,8 @@ class SyntheticGatherer(PreferenceGatherer):
         self.rng = np.random.default_rng(seed=seed)
         self.threshold = threshold
 
-    def __call__(self, fragment_pairs: Sequence[TrajectoryWithRewPair]) -> np.ndarray:
+    def __call__(self, fragment_pairs: Sequence[TrajectoryWithRewPair]) -> \
+            Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
         """Computes probability fragment 1 is preferred over fragment 2."""
         returns1, returns2 = self._reward_sums(fragment_pairs)
         if self.temperature == 0:
@@ -856,8 +899,8 @@ class SyntheticGatherer(PreferenceGatherer):
         self.logger.record("entropy", entropy)
 
         if self.sample:
-            return self.rng.binomial(n=1, p=model_probs).astype(np.float32)
-        return model_probs
+            return fragment_pairs, self.rng.binomial(n=1, p=model_probs).astype(np.float32)
+        return fragment_pairs, model_probs
 
     def _reward_sums(self, fragment_pairs) -> Tuple[np.ndarray, np.ndarray]:
         rews1, rews2 = zip(
@@ -870,6 +913,74 @@ class SyntheticGatherer(PreferenceGatherer):
             ],
         )
         return np.array(rews1, dtype=np.float32), np.array(rews2, dtype=np.float32)
+
+
+class PrefCollectGatherer(PreferenceGatherer):
+    def __init__(self,
+                 pref_collect_address: str,
+                 video_output_dir: str,
+                 video_fps: str = 20,
+                 custom_logger: Optional[imit_logger.HierarchicalLogger] = None):
+        super().__init__(custom_logger)
+        self.query_endpoint = pref_collect_address + "/preferences/query/"
+        self.video_output_dir = video_output_dir
+        self.frames_per_second = video_fps
+        self.pending_queries = {}
+
+    def __call__(self, fragment_pairs: Sequence[TrajectoryPair]) -> \
+            Tuple[Sequence[TrajectoryPair], np.ndarray]:
+
+        new_queries = {str(uuid.uuid4()): query for query in fragment_pairs}
+
+        for query_id, query in new_queries.items():
+            self._write_fragment_video(query[0], name=f'{query_id}-left')
+            self._write_fragment_video(query[1], name=f'{query_id}-right')
+            requests.put(
+                self.query_endpoint + query_id,
+                json={"uuid": "{}".format(query_id)}
+            )
+
+        self.pending_queries |= new_queries
+
+        gathered_queries = []
+        gathered_preferences = []
+
+        for query_id, query in list(self.pending_queries.items()):
+
+            preference = self._gather_preference(query_id)
+
+            if preference is not None:
+                if 0 <= preference <= 1:
+                    gathered_queries.append(query)
+                    gathered_preferences.append(preference)
+                del self.pending_queries[query_id]
+
+        return gathered_queries, np.array(gathered_preferences, dtype=np.float32)
+
+    def _write_fragment_video(self, fragment, name: str) -> None:
+
+        output_file_name = f'{self.video_output_dir}{name}.webm'
+        frame_shape = self._get_frame_shape(fragment)
+
+        video_writer = cv2.VideoWriter(
+            output_file_name,
+            cv2.VideoWriter_fourcc(*'VP90'),
+            self.frames_per_second,
+            frame_shape)
+
+        for frame in fragment.obs:
+            video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+        video_writer.release()
+
+    @staticmethod
+    def _get_frame_shape(fragment) -> Tuple[int, int]:
+        single_frame = np.array(fragment.obs[0])
+        return single_frame.shape[1], single_frame.shape[0]
+
+    def _gather_preference(self, query_id):
+        answered_query = requests.get(self.query_endpoint + query_id).json()
+        return answered_query["label"]
 
 
 class PreferenceDataset(th.utils.data.Dataset):
@@ -1337,9 +1448,7 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
                 or they could be selected more deliberately (active learning).
                 Default is a random fragmenter.
             preference_gatherer: how to get preferences between trajectory fragments.
-                Default (and currently the only option) is to use synthetic preferences
-                based on ground-truth rewards. Human preferences could be implemented
-                here in the future.
+                Default is to use synthetic preferences based on ground-truth rewards.
             reward_trainer: trains the reward model based on pairs of fragments and
                 associated preferences. Default is to use the preference model
                 and loss function from DRLHP.
@@ -1492,42 +1601,45 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs)
             with self.logger.accumulate_means("preferences"):
                 self.logger.log("Gathering preferences")
-                preferences = self.preference_gatherer(fragments)
-            self.dataset.push(fragments, preferences)
+                gathered_fragments, gathered_preferences = self.preference_gatherer(fragments)
+            if len(gathered_fragments) > 0:
+                self.dataset.push(gathered_fragments, gathered_preferences)
             self.logger.log(f"Dataset now contains {len(self.dataset)} comparisons")
 
-            ##########################
-            # Train the reward model #
-            ##########################
+            if len(self.dataset) > 0:
 
-            # On the first iteration, we train the reward model for longer,
-            # as specified by initial_epoch_multiplier.
-            epoch_multiplier = 1.0
-            if i == 0:
-                epoch_multiplier = self.initial_epoch_multiplier
+                ##########################
+                # Train the reward model #
+                ##########################
 
-            with self.logger.accumulate_means("reward"):
-                self.reward_trainer.train(
-                    self.dataset,
-                    epoch_multiplier=epoch_multiplier,
-                )
-            reward_loss = self.logger.name_to_value["mean/reward/loss"]
-            reward_accuracy = self.logger.name_to_value["mean/reward/accuracy"]
+                # On the first iteration, we train the reward model for longer,
+                # as specified by initial_epoch_multiplier.
+                epoch_multiplier = 1.0
+                if i == 0:
+                    epoch_multiplier = self.initial_epoch_multiplier
 
-            ###################
-            # Train the agent #
-            ###################
-            num_steps = timesteps_per_iteration
-            # if the number of timesteps per iterations doesn't exactly divide
-            # the desired total number of timesteps, we train the agent a bit longer
-            # at the end of training (where the reward model is presumably best)
-            if i == self.num_iterations - 1:
-                num_steps += extra_timesteps
-            with self.logger.accumulate_means("agent"):
-                self.logger.log(f"Training agent for {num_steps} timesteps")
-                self.trajectory_generator.train(steps=num_steps)
+                with self.logger.accumulate_means("reward"):
+                    self.reward_trainer.train(
+                        self.dataset,
+                        epoch_multiplier=epoch_multiplier,
+                    )
+                reward_loss = self.logger.name_to_value["mean/reward/loss"]
+                reward_accuracy = self.logger.name_to_value["mean/reward/accuracy"]
 
-            self.logger.dump(self._iteration)
+                ###################
+                # Train the agent #
+                ###################
+                num_steps = timesteps_per_iteration
+                # if the number of timesteps per iterations doesn't exactly divide
+                # the desired total number of timesteps, we train the agent a bit longer
+                # at the end of training (where the reward model is presumably best)
+                if i == self.num_iterations - 1:
+                    num_steps += extra_timesteps
+                with self.logger.accumulate_means("agent"):
+                    self.logger.log(f"Training agent for {num_steps} timesteps")
+                    self.trajectory_generator.train(steps=num_steps)
+
+                self.logger.dump(self._iteration)
 
             ########################
             # Additional Callbacks #
