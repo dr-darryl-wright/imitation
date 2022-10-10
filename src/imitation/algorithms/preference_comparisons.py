@@ -121,6 +121,187 @@ class TrajectoryDataset(TrajectoryGenerator):
         return _get_trajectories(trajectories, steps)
 
 
+class MineRLAgentTrainer(TrajectoryGenerator):
+    """Wrapper for training an SB3 algorithm on an arbitrary reward function."""
+
+    def __init__(
+        self,
+        algorithm: base_class.BaseAlgorithm,
+        reward_fn: Union[reward_function.RewardFn, reward_nets.RewardNet],
+        venv: vec_env.VecEnv,
+        exploration_frac: float = 0.0,
+        switch_prob: float = 0.5,
+        random_prob: float = 0.5,
+        seed: Optional[int] = None,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        """Initialize the agent trainer.
+
+        Args:
+            algorithm: the stable-baselines algorithm to use for training.
+            reward_fn: either a RewardFn or a RewardNet instance that will supply
+                the rewards used for training the agent.
+            venv: vectorized environment to train in.
+            exploration_frac: fraction of the trajectories that will be generated
+                partially randomly rather than only by the agent when sampling.
+            switch_prob: the probability of switching the current policy at each
+                step for the exploratory samples.
+            random_prob: the probability of picking the random policy when switching
+                during exploration.
+            seed: random seed for exploratory trajectories.
+            custom_logger: Where to log to; if None (default), creates a new logger.
+        """
+        self.algorithm = algorithm
+        # NOTE: this has to come after setting self.algorithm because super().__init__
+        # will set self.logger, which also sets the logger for the algorithm
+        super().__init__(custom_logger)
+        if isinstance(reward_fn, reward_nets.RewardNet):
+            # utils.check_for_correct_spaces(
+            #    venv,
+            #    reward_fn.observation_space,
+            #    reward_fn.action_space,
+            # )
+            reward_fn = reward_fn.predict_processed
+        self.reward_fn = reward_fn
+        self.exploration_frac = exploration_frac
+
+        # The BufferingWrapper records all trajectories, so we can return
+        # them after training. This should come first (before the wrapper that
+        # changes the reward function), so that we return the original environment
+        # rewards.
+        # When applying BufferingWrapper and RewardVecEnvWrapper, we should use `venv`
+        # instead of `algorithm.get_env()` because SB3 may apply some wrappers to
+        # `algorithm`'s env under the hood. In particular, in image-based environments,
+        # SB3 may move the image-channel dimension in the observation space, making
+        # `algorithm.get_env()` not match with `reward_fn`.
+        self.buffering_wrapper = wrappers.MineRLBufferingWrapper(venv)
+        self.venv = self.reward_venv_wrapper = reward_wrapper.RewardVecEnvWrapper(
+            self.buffering_wrapper,
+            reward_fn=self.reward_fn,
+        )
+
+        self.log_callback = self.reward_venv_wrapper.make_log_callback()
+
+        self.algorithm.set_env(self.venv)
+        # Unlike with BufferingWrapper, we should use `algorithm.get_env()` instead
+        # of `venv` when interacting with `algorithm`.
+        policy_callable = rollout._policy_to_callable(
+            self.algorithm,
+            self.algorithm.get_env(),
+            # By setting deterministic_policy to False, we ensure that the rollouts
+            # are collected from a deterministic policy only if self.algorithm is
+            # deterministic. If self.algorithm is stochastic, then policy_callable
+            # will also be stochastic.
+            deterministic_policy=False,
+        )
+        self.exploration_wrapper = exploration_wrapper.ExplorationWrapper(
+            policy_callable=policy_callable,
+            venv=self.algorithm.get_env(),
+            random_prob=random_prob,
+            switch_prob=switch_prob,
+            seed=seed,
+        )
+
+    def train(self, steps: int, **kwargs) -> None:
+        """Train the agent using the reward function specified during instantiation.
+
+        Args:
+            steps: number of environment timesteps to train for
+            **kwargs: other keyword arguments to pass to BaseAlgorithm.train()
+
+        Raises:
+            RuntimeError: Transitions left in `self.buffering_wrapper`; call
+                `self.sample` first to clear them.
+        """
+        n_transitions = self.buffering_wrapper.n_transitions
+        if n_transitions:
+            raise RuntimeError(
+                f"There are {n_transitions} transitions left in the buffer. "
+                "Call AgentTrainer.sample() first to clear them.",
+            )
+        self.algorithm.learn(
+            total_timesteps=steps,
+            reset_num_timesteps=False,
+            callback=self.log_callback,
+            **kwargs,
+        )
+
+    def sample(self, steps: int) -> Sequence[types.TrajectoryWithRew]:
+        agent_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+        # We typically have more trajectories than are needed.
+        # In that case, we use the final trajectories because
+        # they are the ones with the most relevant version of
+        # the agent.
+        # The easiest way to do this will be to first invert the
+        # list and then later just take the first trajectories:
+        agent_trajs = agent_trajs[::-1]
+        avail_steps = sum(len(traj) for traj in agent_trajs)
+
+        exploration_steps = int(self.exploration_frac * steps)
+        if self.exploration_frac > 0 and exploration_steps == 0:
+            self.logger.warn(
+                "No exploration steps included: exploration_frac = "
+                f"{self.exploration_frac} > 0 but steps={steps} is too small.",
+            )
+        agent_steps = steps - exploration_steps
+
+        if avail_steps < agent_steps:
+            self.logger.log(
+                f"Requested {agent_steps} transitions but only {avail_steps} in buffer."
+                f" Sampling {agent_steps - avail_steps} additional transitions.",
+            )
+            sample_until = rollout.make_sample_until(
+                min_timesteps=agent_steps - avail_steps,
+                min_episodes=None,
+            )
+            # Important note: we don't want to use the trajectories returned
+            # here because 1) they might miss initial timesteps taken by the RL agent
+            # and 2) their rewards are the ones provided by the reward model!
+            # Instead, we collect the trajectories using the BufferingWrapper.
+            rollout.generate_trajectories(
+                self.algorithm,
+                self.algorithm.get_env(),
+                sample_until=sample_until,
+                # By setting deterministic_policy to False, we ensure that the rollouts
+                # are collected from a deterministic policy only if self.algorithm is
+                # deterministic. If self.algorithm is stochastic, then policy_callable
+                # will also be stochastic.
+                deterministic_policy=False,
+            )
+            additional_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+            agent_trajs = list(agent_trajs) + list(additional_trajs)
+
+        agent_trajs = _get_trajectories(agent_trajs, agent_steps)
+
+        exploration_trajs = []
+        if exploration_steps > 0:
+            self.logger.log(f"Sampling {exploration_steps} exploratory transitions.")
+            sample_until = rollout.make_sample_until(
+                min_timesteps=exploration_steps,
+                min_episodes=None,
+            )
+            rollout.generate_trajectories(
+                policy=self.exploration_wrapper,
+                venv=self.algorithm.get_env(),
+                sample_until=sample_until,
+                # buffering_wrapper collects rollouts from a non-deterministic policy
+                # so we do that here as well for consistency.
+                deterministic_policy=False,
+            )
+            exploration_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+            exploration_trajs = _get_trajectories(exploration_trajs, exploration_steps)
+        # We call _get_trajectories separately on agent_trajs and exploration_trajs
+        # and then just concatenate. This could mean we return slightly too many
+        # transitions, but it gets the proportion of exploratory and agent transitions
+        # roughly right.
+        return list(agent_trajs) + list(exploration_trajs)
+
+    @TrajectoryGenerator.logger.setter
+    def logger(self, value: imit_logger.HierarchicalLogger):
+        self._logger = value
+        self.algorithm.set_logger(self.logger)
+
+
 class AgentTrainer(TrajectoryGenerator):
     """Wrapper for training an SB3 algorithm on an arbitrary reward function."""
 
@@ -781,10 +962,10 @@ class PreferenceQuerent(abc.ABC):
             fragment_pairs: sequence of pairs of trajectory fragments (the queries)
 
         Returns:
-            None. Preferences are assumed to be answered asynchronously. 
-            
+            None. Preferences are assumed to be answered asynchronously.
+
             Note: When preferences are gathered synchronously, e.g. with the `SyntheticGatherer`,
-            use `DummyPreferenceQuerent`.  
+            use `DummyPreferenceQuerent`.
         """  # noqa: DAR202
 
 
@@ -815,8 +996,9 @@ class PreferenceGatherer(abc.ABC):
         self.logger = custom_logger or imit_logger.configure()
 
     @abc.abstractmethod
-    def __call__(self, fragment_pairs: Sequence[TrajectoryPair]) -> \
-            Tuple[Sequence[TrajectoryPair], np.ndarray]:
+    def __call__(
+        self, fragment_pairs: Sequence[TrajectoryPair]
+    ) -> Tuple[Sequence[TrajectoryPair], np.ndarray]:
         """Gathers the probabilities that fragment 1 is preferred in `fragment_pairs`.
 
         Args:
@@ -874,8 +1056,9 @@ class SyntheticGatherer(PreferenceGatherer):
         self.rng = np.random.default_rng(seed=seed)
         self.threshold = threshold
 
-    def __call__(self, fragment_pairs: Sequence[TrajectoryWithRewPair]) -> \
-            Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
+    def __call__(
+        self, fragment_pairs: Sequence[TrajectoryWithRewPair]
+    ) -> Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
         """Computes probability fragment 1 is preferred over fragment 2."""
         returns1, returns2 = self._reward_sums(fragment_pairs)
         if self.temperature == 0:
@@ -899,7 +1082,9 @@ class SyntheticGatherer(PreferenceGatherer):
         self.logger.record("entropy", entropy)
 
         if self.sample:
-            return fragment_pairs, self.rng.binomial(n=1, p=model_probs).astype(np.float32)
+            return fragment_pairs, self.rng.binomial(n=1, p=model_probs).astype(
+                np.float32
+            )
         return fragment_pairs, model_probs
 
     def _reward_sums(self, fragment_pairs) -> Tuple[np.ndarray, np.ndarray]:
@@ -916,28 +1101,30 @@ class SyntheticGatherer(PreferenceGatherer):
 
 
 class PrefCollectGatherer(PreferenceGatherer):
-    def __init__(self,
-                 pref_collect_address: str,
-                 video_output_dir: str,
-                 video_fps: str = 20,
-                 custom_logger: Optional[imit_logger.HierarchicalLogger] = None):
+    def __init__(
+        self,
+        pref_collect_address: str,
+        video_output_dir: str,
+        video_fps: str = 20,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
         super().__init__(custom_logger)
         self.query_endpoint = pref_collect_address + "/preferences/query/"
         self.video_output_dir = video_output_dir
         self.frames_per_second = video_fps
         self.pending_queries = {}
 
-    def __call__(self, fragment_pairs: Sequence[TrajectoryPair]) -> \
-            Tuple[Sequence[TrajectoryPair], np.ndarray]:
+    def __call__(
+        self, fragment_pairs: Sequence[TrajectoryPair]
+    ) -> Tuple[Sequence[TrajectoryPair], np.ndarray]:
 
         new_queries = {str(uuid.uuid4()): query for query in fragment_pairs}
 
         for query_id, query in new_queries.items():
-            self._write_fragment_video(query[0], name=f'{query_id}-left')
-            self._write_fragment_video(query[1], name=f'{query_id}-right')
+            self._write_fragment_video(query[0], name=f"{query_id}-left")
+            self._write_fragment_video(query[1], name=f"{query_id}-right")
             requests.put(
-                self.query_endpoint + query_id,
-                json={"uuid": "{}".format(query_id)}
+                self.query_endpoint + query_id, json={"uuid": "{}".format(query_id)}
             )
 
         self.pending_queries |= new_queries
@@ -959,14 +1146,15 @@ class PrefCollectGatherer(PreferenceGatherer):
 
     def _write_fragment_video(self, fragment, name: str) -> None:
 
-        output_file_name = f'{self.video_output_dir}{name}.webm'
+        output_file_name = f"{self.video_output_dir}{name}.webm"
         frame_shape = self._get_frame_shape(fragment)
 
         video_writer = cv2.VideoWriter(
             output_file_name,
-            cv2.VideoWriter_fourcc(*'VP90'),
+            cv2.VideoWriter_fourcc(*"VP90"),
             self.frames_per_second,
-            frame_shape)
+            frame_shape,
+        )
 
         for frame in fragment.obs:
             video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
@@ -1601,7 +1789,9 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs)
             with self.logger.accumulate_means("preferences"):
                 self.logger.log("Gathering preferences")
-                gathered_fragments, gathered_preferences = self.preference_gatherer(fragments)
+                gathered_fragments, gathered_preferences = self.preference_gatherer(
+                    fragments
+                )
             if len(gathered_fragments) > 0:
                 self.dataset.push(gathered_fragments, gathered_preferences)
             self.logger.log(f"Dataset now contains {len(self.dataset)} comparisons")
