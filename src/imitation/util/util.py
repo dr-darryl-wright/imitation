@@ -15,6 +15,7 @@ from typing import (
     Sequence,
     TypeVar,
     Union,
+    Tuple,
 )
 import subprocess
 import shutil
@@ -243,12 +244,13 @@ def tensor_iter_norm(
 
 
 class FFMPEGVideo(object):
-    def __init__(self, name: str = None):
+    def __init__(self, name: str = None, shape: Tuple[int, int] = None):
         super(FFMPEGVideo, self).__init__()
         self._ffmpeg = shutil.which("ffmpeg")
         self._name = name
         self._workdir = mkdtemp(prefix="FFMPEGVideo.", dir=os.getcwd())
         self._framecounter = 0
+        self._shape = shape
 
         assert self._ffmpeg is not None  # should add ffmpeg\bin directory to PATH
 
@@ -259,6 +261,9 @@ class FFMPEGVideo(object):
         filename = os.path.join(
             self._workdir, "frame_{:08d}.png".format(self._framecounter)
         )
+
+        if self._shape is None:
+            self._shape = frame.shape[:2].T
 
         if isinstance(frame, np.ndarray):
             img = Image.fromarray(frame)
@@ -326,6 +331,8 @@ class FFMPEGVideo(object):
                 self._ffmpeg,
                 "-i",
                 filename,
+                "-s",
+                f"{self._shape[0]}x{self._shape[1]}",
                 "-vcodec",
                 "libvpx",
                 "-acodec",
@@ -344,6 +351,6 @@ class FFMPEGVideo(object):
                     ffmpeg.returncode, " ".join(ffmpeg.args)
                 )
             )
-
-        if not keep_mp4:
-            os.remove(filename)
+        else:
+            if not keep_mp4:
+                os.remove(filename)
