@@ -1148,9 +1148,18 @@ class PrefCollectGatherer(PreferenceGatherer):
         output_file_name = f"{self.video_output_dir}{name}.mp4"
         frame_shape = self._get_frame_shape(fragment)
 
-        video_writer = util.FFMPEGVideo(output_file_name)
+        video_writer = util.FFMPEGVideo(output_file_name, frame_shape)
 
-        for frame in fragment.obs:
+        # make videos from original observations if possible
+        if "original_obs" in fragment.infos[0]:
+            frames = [
+                fragment.infos[i]["original_obs"] for i in range(len(fragment.infos))
+            ]
+        else:
+            frames = fragment.obs
+
+        for frame in frames:
+            # transform into RGB array
             if frame.shape[-1] < 3:
                 missing_channels = 3 - frame.shape[-1]
                 frame = np.concatenate(
@@ -1164,7 +1173,10 @@ class PrefCollectGatherer(PreferenceGatherer):
 
     @staticmethod
     def _get_frame_shape(fragment) -> Tuple[int, int]:
-        single_frame = np.array(fragment.obs[0])
+        if "original_obs" in fragment.infos[0]:
+            single_frame = np.array(fragment.infos[0]["original_obs"])
+        else:
+            single_frame = np.array(fragment.obs[0])
         return single_frame.shape[1], single_frame.shape[0]
 
     def _gather_preference(self, query_id):
@@ -1791,7 +1803,7 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             with self.logger.accumulate_means("preferences"):
                 self.logger.log("Gathering preferences")
                 gathered_fragments, gathered_preferences = self.preference_gatherer(
-                    fragments
+                    fragments,
                 )
             if len(gathered_fragments) > 0:
                 self.dataset.push(gathered_fragments, gathered_preferences)
