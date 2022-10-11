@@ -21,7 +21,6 @@ from typing import (
     Union,
 )
 
-import cv2
 import numpy as np
 import requests
 import torch as th
@@ -1146,20 +1145,22 @@ class PrefCollectGatherer(PreferenceGatherer):
 
     def _write_fragment_video(self, fragment, name: str) -> None:
 
-        output_file_name = f"{self.video_output_dir}{name}.webm"
+        output_file_name = f"{self.video_output_dir}{name}.mp4"
         frame_shape = self._get_frame_shape(fragment)
 
-        video_writer = cv2.VideoWriter(
-            output_file_name,
-            cv2.VideoWriter_fourcc(*"VP90"),
-            self.frames_per_second,
-            frame_shape,
-        )
+        video_writer = util.FFMPEGVideo(output_file_name)
 
         for frame in fragment.obs:
-            video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            if frame.shape[-1] < 3:
+                missing_channels = 3 - frame.shape[-1]
+                frame = np.concatenate(
+                    [frame] + missing_channels * [frame[..., -1][..., None]], axis=-1
+                )
 
-        video_writer.release()
+            video_writer.add_frame(frame)
+
+        video_writer.save(fps=self.frames_per_second)
+        video_writer.to_webm()
 
     @staticmethod
     def _get_frame_shape(fragment) -> Tuple[int, int]:

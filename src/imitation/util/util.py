@@ -16,6 +16,10 @@ from typing import (
     TypeVar,
     Union,
 )
+import subprocess
+import shutil
+from tempfile import mkdtemp
+from PIL import Image
 
 import gym
 import numpy as np
@@ -236,3 +240,110 @@ def tensor_iter_norm(
     # = sum(x**ord for x in tensor for tensor in tensor_iter)**(1/ord)
     # = th.norm(concatenated tensors)
     return th.norm(norm_tensor, p=ord)
+
+
+class FFMPEGVideo(object):
+    def __init__(self, name: str = None):
+        super(FFMPEGVideo, self).__init__()
+        self._ffmpeg = shutil.which("ffmpeg")
+        self._name = name
+        self._workdir = mkdtemp(prefix="FFMPEGVideo.", dir=os.getcwd())
+        self._framecounter = 0
+
+        assert self._ffmpeg is not None  # should add ffmpeg\bin directory to PATH
+
+    def __len__(self):
+        return self._framecounter
+
+    def add_frame(self, frame):
+        filename = os.path.join(
+            self._workdir, "frame_{:08d}.png".format(self._framecounter)
+        )
+
+        if isinstance(frame, np.ndarray):
+            img = Image.fromarray(frame)
+            img.save(filename)
+        else:
+            frame.save(filename)
+
+        self._framecounter += 1
+
+    def save(self, filename: str = None, fps: int = 30, keep_frame_images=False):
+        if self._framecounter == 0:
+            raise Exception("No frames stored.")
+
+        if filename is None:
+            assert self._name is not None
+            filename = self._name
+
+        if not filename.lower().endswith(".mp4"):
+            filename += ".mp4"
+
+        print("running ffmpeg")
+        ffmpeg = subprocess.run(
+            [
+                self._ffmpeg,
+                "-y",  # force overwrite if output file exists
+                "-framerate",
+                "{}".format(fps),
+                "-i",
+                os.path.join(self._workdir, "frame_%08d.png"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "slow",
+                "-crf",
+                "17",
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
+                filename,
+            ]
+        )
+
+        if ffmpeg.returncode != 0:
+            # TODO proper logging
+            print("error")
+            print(
+                "Running the following command failed with return code {}:\n\t{}".format(
+                    ffmpeg.returncode, " ".join(ffmpeg.args)
+                )
+            )
+        elif not keep_frame_images:
+            shutil.rmtree(self._workdir)
+
+    def to_webm(self, filename: str = None, keep_mp4: bool = False):
+        if filename is None:
+            assert self._name is not None
+            filename = self._name
+
+        if not filename.lower().endswith(".mp4"):
+            new_filename = filename + ".webm"
+        else:
+            new_filename = filename[:-4] + ".webm"
+
+        ffmpeg = subprocess.run(
+            [
+                self._ffmpeg,
+                "-i",
+                filename,
+                "-vcodec",
+                "libvpx",
+                "-acodec",
+                "libvorbis",
+                "-crf",
+                "5",
+                new_filename,
+            ]
+        )
+
+        if ffmpeg.returncode != 0:
+            # TODO proper logging
+            print("error")
+            print(
+                "Running the following command failed with return code {}:\n\t{}".format(
+                    ffmpeg.returncode, " ".join(ffmpeg.args)
+                )
+            )
+
+        if not keep_mp4:
+            os.remove(filename)
