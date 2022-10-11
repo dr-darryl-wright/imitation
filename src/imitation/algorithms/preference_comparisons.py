@@ -1127,7 +1127,7 @@ class PrefCollectGatherer(PreferenceGatherer):
                 self.query_endpoint + query_id, json={"uuid": "{}".format(query_id)}
             )
 
-        self.pending_queries |= new_queries
+        self.pending_queries = {**self.pending_queries, **new_queries}
 
         gathered_queries = []
         gathered_preferences = []
