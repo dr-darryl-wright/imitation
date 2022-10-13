@@ -174,7 +174,7 @@ class MineRLAgentTrainer(TrajectoryGenerator):
         # SB3 may move the image-channel dimension in the observation space, making
         # `algorithm.get_env()` not match with `reward_fn`.
         self.buffering_wrapper = wrappers.MineRLBufferingWrapper(venv)
-        self.venv = self.reward_venv_wrapper = reward_wrapper.RewardVecEnvWrapper(
+        self.venv = self.reward_venv_wrapper = reward_wrapper.MineRLRewardVecEnvWrapper(
             self.buffering_wrapper,
             reward_fn=self.reward_fn,
         )
