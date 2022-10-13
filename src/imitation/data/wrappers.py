@@ -190,12 +190,16 @@ class MineRLBufferingWrapper(VecEnvWrapper):
             raise RuntimeError("BufferingWrapper reset() before samples were accessed")
         self._init_reset = True
         self.n_transitions = 0
-        obs = self.venv.reset(**kwargs)
+        dict_obs = self.venv.reset(**kwargs)
+
+        # Remove hidden state
+        obs = dict_obs["img"]
+
         self._traj_accum = rollout.TrajectoryAccumulator()
         for i, ob in enumerate(obs):
             self._traj_accum.add_step({"obs": ob}, key=i)
         self._timesteps = np.zeros((len(obs),), dtype=int)
-        return obs
+        return dict_obs
 
     def step_async(self, actions):
         assert self._init_reset
@@ -207,10 +211,10 @@ class MineRLBufferingWrapper(VecEnvWrapper):
         assert self._init_reset
         assert self._saved_acts is not None
         acts, self._saved_acts = self._saved_acts, None
-        obs, rews, dones, infos = self.venv.step_wait()
+        dict_obs, rews, dones, infos = self.venv.step_wait()
 
         # Remove hidden state
-        obs = obs["img"]
+        obs = dict_obs["img"]
 
         self.n_transitions += self.num_envs
         self._timesteps += 1
@@ -228,7 +232,7 @@ class MineRLBufferingWrapper(VecEnvWrapper):
         )
         self._trajectories.extend(finished_trajs)
 
-        return obs, rews, dones, infos
+        return dict_obs, rews, dones, infos
 
     def _finish_partial_trajectories(self) -> Sequence[types.TrajectoryWithRew]:
         """Finishes and returns partial trajectories in `self._traj_accum`."""
