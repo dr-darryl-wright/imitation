@@ -121,6 +121,7 @@ class RewardVecEnvWrapper(vec_env.VecEnvWrapper):
 
 class MineRLRewardVecEnvWrapper(vec_env.VecEnvWrapper):
     """Uses a provided reward_fn to replace the reward function returned by `step()`.
+    Makes sure to pass MineRL image observations to the reward fn.
 
     Automatically resets the inner VecEnv upon initialization. A tricky part
     about this class is keeping track of the most recent observation from each
@@ -165,9 +166,6 @@ class MineRLRewardVecEnvWrapper(vec_env.VecEnvWrapper):
 
     def reset(self):
         self._old_obs = self.venv.reset()
-        if self.num_envs == -1:
-            # obs is not a list yet
-            self._old_obs = [self._old_obs]
         return self._old_obs
 
     def step_async(self, actions):
@@ -177,22 +175,23 @@ class MineRLRewardVecEnvWrapper(vec_env.VecEnvWrapper):
     def step_wait(self):
         obs, old_rews, dones, infos = self.venv.step_wait()
 
-        if self.num_envs == -1:
-            # obs is not a list yet
-            obs = [obs]
-
         # The vecenvs automatically reset the underlying environments once they
         # encounter a `done`, in which case the last observation corresponding to
         # the `done` is dropped. We're going to pull it back out of the info dict!
-        # obs_fixed = []
-        # for single_obs, single_done, single_infos in zip(obs, dones, infos):
-        #    if single_done:
-        #        single_obs = single_infos["terminal_observation"]
+        obs_fixed = []
+        for single_obs, single_done, single_infos in zip([obs], dones, infos):
+            if single_done:
+                single_obs = single_infos["terminal_observation"]
 
-        #    obs_fixed.append(single_obs["img"].squeeze(1))
-        # obs_fixed = np.stack(obs_fixed)
+            obs_fixed.append(single_obs["img"].squeeze(1))
+        obs_fixed = np.stack(obs_fixed).squeeze(0)
 
-        rews = self.reward_fn(self._old_obs["img"].squeeze(1), self._actions, obs["img"].squeeze(1), np.array(dones))
+        rews = self.reward_fn(
+            self._old_obs["img"].squeeze(1),
+            self._actions,
+            obs_fixed,
+            np.array(dones),
+        )
         assert len(rews) == len(obs["img"]), "must return one rew for each env"
         done_mask = np.asarray(dones, dtype="bool").reshape((len(dones),))
 

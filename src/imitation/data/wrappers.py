@@ -193,7 +193,7 @@ class MineRLBufferingWrapper(VecEnvWrapper):
         dict_obs = self.venv.reset(**kwargs)
 
         # Remove hidden state
-        obs = dict_obs["img"]
+        obs = dict_obs["img"].squeeze(1)
 
         self._traj_accum = rollout.TrajectoryAccumulator()
         for i, ob in enumerate(obs):
@@ -211,10 +211,10 @@ class MineRLBufferingWrapper(VecEnvWrapper):
         assert self._init_reset
         assert self._saved_acts is not None
         acts, self._saved_acts = self._saved_acts, None
-        dict_obs, rews, dones, infos = self.venv.step_wait()
+        dict_obs, rews, dones, orig_infos = self.venv.step_wait()
 
         # Remove hidden state
-        obs = dict_obs["img"]
+        obs = dict_obs["img"].squeeze(1)
 
         self.n_transitions += self.num_envs
         self._timesteps += 1
@@ -223,16 +223,31 @@ class MineRLBufferingWrapper(VecEnvWrapper):
             self._ep_lens += list(ep_lens)
         self._timesteps[dones] = 0
 
+        # Remove hidden state also for the terminal observation
+        new_infos = []
+        for info in orig_infos:
+            new_info = info.copy()
+            if "terminal_observation" in info:
+                new_info["terminal_observation"] = info["terminal_observation"]["img"].numpy().squeeze(0)
+            new_infos.append(new_info)
+        new_infos = np.stack(new_infos, axis=0)
+
         finished_trajs = self._traj_accum.add_steps_and_auto_finish(
             acts,
             obs,
             rews,
             dones,
-            infos,
+            new_infos,
         )
         self._trajectories.extend(finished_trajs)
 
-        return dict_obs, rews, dones, infos
+        # Pass accumulated trajectories into the infos dict
+        # which is required by 
+        # generate_trajectories_via_bufferingwrapper
+        for info in orig_infos:
+            info["finished_trajs"] = finished_trajs
+
+        return dict_obs, rews, dones, orig_infos
 
     def _finish_partial_trajectories(self) -> Sequence[types.TrajectoryWithRew]:
         """Finishes and returns partial trajectories in `self._traj_accum`."""
@@ -310,8 +325,6 @@ class MineRLBufferingWrapper(VecEnvWrapper):
         transitions = rollout.flatten_trajectories_with_rew(trajectories)
         assert len(transitions.obs) == n_transitions
         return transitions
-
-
 
 
 class RolloutInfoWrapper(gym.Wrapper):

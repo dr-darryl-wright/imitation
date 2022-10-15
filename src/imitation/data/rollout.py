@@ -305,6 +305,100 @@ def _policy_to_callable(
     return get_actions
 
 
+def generate_trajectories_via_bufferingwrapper(
+    policy: AnyPolicy,
+    venv: VecEnv,
+    sample_until: GenTrajTerminationFn,
+    *,
+    deterministic_policy: bool = False,
+    rng: np.random.RandomState = np.random,
+) -> Sequence[types.TrajectoryWithRew]:
+    """Generate trajectory dictionaries from a policy via a BufferingWrapper that is part of the passed enviroment.
+    The returned trajectories are obtained from the underlying BufferingWrapper which needs to pass them as part of the `infos` dict.
+
+    Args:
+        policy: Can be any of the following:
+            1) A stable_baselines3 policy or algorithm trained on the gym environment.
+            2) A Callable that takes an ndarray of observations and returns an ndarray
+            of corresponding actions.
+            3) None, in which case actions will be sampled randomly.
+        venv: The vectorized environments to interact with.
+        sample_until: A function determining the termination condition.
+            It takes a sequence of trajectories, and returns a bool.
+            Most users will want to use one of `min_episodes` or `min_timesteps`.
+        deterministic_policy: If True, asks policy to deterministically return
+            action. Note the trajectories might still be non-deterministic if the
+            environment has non-determinism!
+        rng: used for shuffling trajectories.
+
+    Returns:
+        Sequence of trajectories, satisfying `sample_until`. Additional trajectories
+        may be collected to avoid biasing process towards short episodes; the user
+        should truncate if required.
+    """
+    get_actions = _policy_to_callable(policy, venv, deterministic_policy)
+
+    # Collect rollout tuples.
+    trajectories = []
+
+    obs = venv.reset()
+
+    # Now, we sample until `sample_until(trajectories)` is true.
+    # If we just stopped then this would introduce a bias towards shorter episodes,
+    # since longer episodes are more likely to still be active, i.e. in the process
+    # of being sampled from. To avoid this, we continue sampling until all epsiodes
+    # are complete.
+    #
+    # To start with, all environments are active.
+    active = np.ones(venv.num_envs, dtype=bool)
+    while np.any(active):
+        acts = get_actions(obs)
+        obs, rews, dones, infos = venv.step(acts)
+
+        # If an environment is inactive, i.e. the episode completed for that
+        # environment after `sample_until(trajectories)` was true, then we do
+        # *not* want to add any subsequent trajectories from it. We avoid this
+        # by just making it never done.
+        dones &= active
+
+        new_trajs = infos[0]["finished_trajs"]
+        trajectories.extend(new_trajs)
+
+        if sample_until(trajectories):
+            # Termination condition has been reached. Mark as inactive any
+            # environments where a trajectory was completed this timestep.
+            active &= ~dones
+
+    # Note that we just drop partial trajectories. This is not ideal for some
+    # algos; e.g. BC can probably benefit from partial trajectories, too.
+
+    # Each trajectory is sampled i.i.d.; however, shorter episodes are added to
+    # `trajectories` sooner. Shuffle to avoid bias in order. This is important
+    # when callees end up truncating the number of trajectories or transitions.
+    # It is also cheap, since we're just shuffling pointers.
+    rng.shuffle(trajectories)
+
+    # Sanity checks are ignored for MineRL
+    # because observation spaces required for compatibility with SB3
+    # is different from the one required for compatibility with the
+    # CnnRewardNet from imitation (former dict, latter image)
+    # Sanity checks.
+    # for trajectory in trajectories:
+    #    n_steps = len(trajectory.acts)
+    # extra 1 for the end
+    #    exp_obs = (n_steps + 1,) + venv.observation_space.shape
+    #    real_obs = trajectory.obs.shape
+    #    assert real_obs == exp_obs, f"expected shape {exp_obs}, got {real_obs}"
+    #    exp_act = (n_steps,) + venv.action_space.shape
+    #    real_act = trajectory.acts.shape
+    #    assert real_act == exp_act, f"expected shape {exp_act}, got {real_act}"
+    #    exp_rew = (n_steps,)
+    #    real_rew = trajectory.rews.shape
+    #    assert real_rew == exp_rew, f"expected shape {exp_rew}, got {real_rew}"
+
+    return trajectories
+
+
 def generate_trajectories(
     policy: AnyPolicy,
     venv: VecEnv,

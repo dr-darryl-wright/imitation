@@ -257,7 +257,7 @@ class MineRLAgentTrainer(TrajectoryGenerator):
             # here because 1) they might miss initial timesteps taken by the RL agent
             # and 2) their rewards are the ones provided by the reward model!
             # Instead, we collect the trajectories using the BufferingWrapper.
-            rollout.generate_trajectories(
+            rollout.generate_trajectories_via_bufferingwrapper(
                 self.algorithm,
                 self.algorithm.get_env(),
                 sample_until=sample_until,
@@ -279,7 +279,7 @@ class MineRLAgentTrainer(TrajectoryGenerator):
                 min_timesteps=exploration_steps,
                 min_episodes=None,
             )
-            rollout.generate_trajectories(
+            rollout.generate_trajectories_via_bufferingwrapper(
                 policy=self.exploration_wrapper,
                 venv=self.algorithm.get_env(),
                 sample_until=sample_until,
@@ -1153,7 +1153,7 @@ class PrefCollectGatherer(PreferenceGatherer):
         # make videos from original observations if possible
         if "original_obs" in fragment.infos[0]:
             frames = [
-                fragment.infos[i]["original_obs"] for i in range(len(fragment.infos))
+                fragment.infos[i]["original_obs"]["pov"] for i in range(len(fragment.infos))
             ]
         else:
             frames = fragment.obs
@@ -1174,7 +1174,7 @@ class PrefCollectGatherer(PreferenceGatherer):
     @staticmethod
     def _get_frame_shape(fragment) -> Tuple[int, int]:
         if "original_obs" in fragment.infos[0]:
-            single_frame = np.array(fragment.infos[0]["original_obs"])
+            single_frame = np.array(fragment.infos[0]["original_obs"]["pov"])
         else:
             single_frame = np.array(fragment.obs[0])
         return single_frame.shape[1], single_frame.shape[0]
