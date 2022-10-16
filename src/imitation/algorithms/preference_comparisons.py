@@ -5,6 +5,7 @@ between trajectory fragments.
 """
 import abc
 import math
+import os
 import pickle
 import random
 import uuid
@@ -1113,6 +1114,9 @@ class PrefCollectGatherer(PreferenceGatherer):
         self.frames_per_second = video_fps
         self.pending_queries = {}
 
+        # create video directory
+        os.mkdirs(self.video_output_dir, exist_ok=True)
+
     def __call__(
         self, fragment_pairs: Sequence[TrajectoryPair]
     ) -> Tuple[Sequence[TrajectoryPair], np.ndarray]:
@@ -1153,7 +1157,8 @@ class PrefCollectGatherer(PreferenceGatherer):
         # make videos from original observations if possible
         if "original_obs" in fragment.infos[0]:
             frames = [
-                fragment.infos[i]["original_obs"]["pov"] for i in range(len(fragment.infos))
+                fragment.infos[i]["original_obs"]["pov"]
+                for i in range(len(fragment.infos))
             ]
         else:
             frames = fragment.obs
