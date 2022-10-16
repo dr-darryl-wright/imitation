@@ -1115,7 +1115,7 @@ class PrefCollectGatherer(PreferenceGatherer):
         self.pending_queries = {}
 
         # create video directory
-        os.mkdirs(self.video_output_dir, exist_ok=True)
+        os.makedirs(self.video_output_dir, exist_ok=True)
 
     def __call__(
         self, fragment_pairs: Sequence[TrajectoryPair]
