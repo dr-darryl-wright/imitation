@@ -4,6 +4,7 @@ import datetime
 import functools
 import itertools
 import os
+import random
 import uuid
 from typing import (
     Any,
@@ -354,3 +355,9 @@ class FFMPEGVideo(object):
         else:
             if not keep_mp4:
                 os.remove(filename)
+
+def weighted_sample_without_replacement(population, weights, k, rng=random):
+    """From https://maxhalford.github.io/blog/weighted-sampling-without-replacement/"""
+    v = [rng.random() ** (1 / w) for w in weights]
+    order = sorted(range(len(population)), key=lambda i: v[i])
+    return [population[i] for i in order[-k:]]

@@ -904,7 +904,8 @@ class MineRLFragmenter(Fragmenter):
         fragments1 = []
         fragements2 = []
         for _ in range(num_pairs):
-            trajs = self.rng.sample(trajectories, weights, k=2)
+            trajs = util.weighted_sample_without_replacement(trajectories, weights, 2, rng=rng)
+            #trajs = self.rng.sample(trajectories, weights, k=2)
             n1 = len(trajs[0])
             n2 = len(trajs[1])
             start1 = n1 - fragment_length
