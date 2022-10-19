@@ -915,17 +915,17 @@ class MineRLFragmenter(Fragmenter):
             terminal1 = trajs[0].terminal
             terminal2 = trajs[1].terminal
             fragment1 = TrajectoryWithRew(
-                obs=traj.obs[start1 : end1 + 1],
-                acts=traj.acts[start1:end1],
-                infos=traj.infos[start1:end1] if traj[0].infos is not None else None,
-                rews=traj.rews[start1:end1],
+                obs=trajs[0].obs[start1 : end1 + 1],
+                acts=trajs[0].acts[start1:end1],
+                infos=trajs[0].infos[start1:end1] if trajs[0].infos is not None else None,
+                rews=trajs[0].rews[start1:end1],
                 terminal=terminal1,
             )
             fragment2 = TrajectoryWithRew(
-                obs=traj.obs[start2 : end2 + 1],
-                acts=traj.acts[start2:end2],
-                infos=traj.infos[start2:end2] if traj[1].infos is not None else None,
-                rews=traj.rews[start2:end2],
+                obs=trajs[1].obs[start2 : end2 + 1],
+                acts=trajs[1].acts[start2:end2],
+                infos=trajs[1].infos[start2:end2] if trajs[1].infos is not None else None,
+                rews=trajs[1].rews[start2:end2],
                 terminal=terminal2,
             )
             fragments1.append(fragment1)
