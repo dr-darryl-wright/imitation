@@ -45,6 +45,9 @@ from imitation.rewards import reward_function, reward_nets, reward_wrapper
 from imitation.util import logger as imit_logger
 from imitation.util import networks, util
 
+import wandb
+from wandb.integration.sb3 import WandbCallback
+
 
 class TrajectoryGenerator(abc.ABC):
     """Generator of trajectories with optional training logic."""
@@ -180,7 +183,9 @@ class MineRLAgentTrainer(TrajectoryGenerator):
             reward_fn=self.reward_fn,
         )
 
-        self.log_callback = self.reward_venv_wrapper.make_log_callback()
+        self.log_callback = [self.reward_venv_wrapper.make_log_callback()]
+        if wandb.run is not None:
+            self.log_callback.append(WandbCallback())
 
         self.algorithm.set_env(self.venv)
         # Unlike with BufferingWrapper, we should use `algorithm.get_env()` instead
