@@ -356,6 +356,7 @@ class FFMPEGVideo(object):
             if not keep_mp4:
                 os.remove(filename)
 
+
 def weighted_sample_without_replacement(population, weights, k, rng=random):
     """From https://maxhalford.github.io/blog/weighted-sampling-without-replacement/"""
     v = [rng.random() ** (1 / w) for w in weights]
