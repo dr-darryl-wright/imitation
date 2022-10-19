@@ -827,6 +827,113 @@ class RandomFragmenter(Fragmenter):
         iterator = iter(fragments)
         return list(zip(iterator, iterator))
 
+    
+class MineRLFragmenter(Fragmenter):
+    """Sample fragments of trajectories from MineRL envs
+    Never query a comparison between fragments of the same trajcetories.
+    """
+
+    def __init__(
+        self,
+        seed: Optional[float] = None,
+        warning_threshold: int = 10,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        """Initialize the fragmenter.
+
+        Args:
+            seed: an optional seed for the internal RNG
+            warning_threshold: give a warning if the number of available
+                transitions is less than this many times the number of
+                required samples. Set to 0 to disable this warning.
+            custom_logger: Where to log to; if None (default), creates a new logger.
+        """
+        super().__init__(custom_logger)
+        self.rng = random.Random(seed)
+        self.warning_threshold = warning_threshold
+
+    def __call__(
+        self,
+        trajectories: Sequence[TrajectoryWithRew],
+        fragment_length: int,
+        num_pairs: int,
+    ) -> Sequence[TrajectoryWithRewPair]:
+        fragments1: List[TrajectoryWithRew] = []
+        fragments2: List[TrajectoryWithRew] = []
+
+        prev_num_trajectories = len(trajectories)
+        # filter out all trajectories that are too short
+        trajectories = [traj for traj in trajectories if len(traj) >= fragment_length]
+        if len(trajectories) == 0:
+            raise ValueError(
+                "No trajectories are long enough for the desired fragment length "
+                f"of {fragment_length}.",
+            )
+        num_discarded = prev_num_trajectories - len(trajectories)
+        if num_discarded:
+            self.logger.log(
+                f"Discarded {num_discarded} out of {prev_num_trajectories} "
+                "trajectories because they are shorter than the desired length "
+                f"of {fragment_length}.",
+            )
+
+        weights = [len(traj) for traj in trajectories]
+
+        # number of transitions that will be contained in the fragments
+        num_transitions = 2 * num_pairs * fragment_length
+        if sum(weights) < num_transitions:
+            self.logger.warn(
+                "Fewer transitions available than needed for desired number "
+                "of fragment pairs. Some transitions will appear multiple times.",
+            )
+        elif (
+            self.warning_threshold
+            and sum(weights) < self.warning_threshold * num_transitions
+        ):
+            # If the number of available transitions is not much larger
+            # than the number of requires ones, we already give a warning.
+            # But only if self.warning_threshold is non-zero.
+            self.logger.warn(
+                f"Samples will contain {num_transitions} transitions in total "
+                f"and only {sum(weights)} are available. "
+                f"Because we sample with replacement, a significant number "
+                "of transitions are likely to appear multiple times.",
+            )
+
+        # we need two fragments for each comparison
+        fragments1 = []
+        fragements2 = []
+        for _ in range(num_pairs):
+            trajs = self.rng.sample(trajectories, weights, k=2)
+            n1 = len(trajs[0])
+            n2 = len(trajs[1])
+            start1 = n1 - fragment_length
+            start2 = n2 - fragment_length
+            end1 = n1
+            end2 = n2
+            terminal1 = trajs[0].terminal
+            terminal2 = trajs[1].terminal
+            fragment1 = TrajectoryWithRew(
+                obs=traj.obs[start1 : end1 + 1],
+                acts=traj.acts[start1:end1],
+                infos=traj.infos[start1:end1] if traj[0].infos is not None else None,
+                rews=traj.rews[start1:end1],
+                terminal=terminal1,
+            )
+            fragment2 = TrajectoryWithRew(
+                obs=traj.obs[start2 : end2 + 1],
+                acts=traj.acts[start2:end2],
+                infos=traj.infos[start2:end2] if traj[1].infos is not None else None,
+                rews=traj.rews[start2:end2],
+                terminal=terminal2,
+            )
+            fragments1.append(fragment1)
+            fragments2.append(fragment2)
+        return list(zip(fragments1, fragments2))
+
+
+
+
 
 class ActiveSelectionFragmenter(Fragmenter):
     """Sample fragments of trajectories based on active selection.
