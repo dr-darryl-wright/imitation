@@ -862,6 +862,9 @@ class MineRLFragmenter(Fragmenter):
         fragments2: List[TrajectoryWithRew] = []
 
         prev_num_trajectories = len(trajectories)
+        if prev_num_trajectories < 2:
+            raise ValueError("Not enough trajectories to fragment.")
+
         # filter out all trajectories that are too short
         trajectories = [traj for traj in trajectories if len(traj) >= fragment_length]
         if len(trajectories) == 0:
@@ -901,8 +904,6 @@ class MineRLFragmenter(Fragmenter):
             )
 
         # we need two fragments for each comparison
-        fragments1 = []
-        fragements2 = []
         for _ in range(num_pairs):
             trajs = util.weighted_sample_without_replacement(trajectories, weights, 2, rng=self.rng)
             #trajs = self.rng.sample(trajectories, weights, k=2)
@@ -1269,11 +1270,12 @@ class PrefCollectGatherer(PreferenceGatherer):
 
         # make videos from original observations if possible
         if "original_obs" in fragment.infos[0]:
-            frames = [
-                fragment.infos[i]["original_obs"]["pov"]
-                for i in range(len(fragment.infos))
-            ]
+            frames = []
+            for i in range(len(fragment.infos)):
+                frames.append(fragment.infos[i]["original_obs"]["pov"])
+                #del fragment.infos[i]["original_obs"]
         else:
+           #self.logger.log("'original_obs' not in infos dict.")
             frames = fragment.obs
 
         for frame in frames:
@@ -1916,7 +1918,7 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             # (but allows for fragments missing terminal timesteps).
             horizons = (len(traj) for traj in trajectories if traj.terminal)
             self._check_fixed_horizon(horizons)
-            self.logger.log("Creating fragment pairs")
+            self.logger.log(f"Creating fragment pairs from {len(trajectories)} trajectories.")
             fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs)
             with self.logger.accumulate_means("preferences"):
                 self.logger.log("Gathering preferences")
