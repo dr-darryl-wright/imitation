@@ -4,6 +4,7 @@ Trains a reward model and optionally a policy based on preferences
 between trajectory fragments.
 """
 import abc
+import glob
 import math
 import os
 import pickle
@@ -25,11 +26,13 @@ from typing import (
 import numpy as np
 import requests
 import torch as th
+import wandb
 from scipy import special
 from stable_baselines3.common import base_class, type_aliases, utils, vec_env
 from torch import nn
 from torch.utils import data as data_th
 from tqdm.auto import tqdm
+from wandb.integration.sb3 import WandbCallback
 
 from imitation.algorithms import base
 from imitation.data import rollout, types, wrappers
@@ -44,9 +47,6 @@ from imitation.policies import exploration_wrapper
 from imitation.rewards import reward_function, reward_nets, reward_wrapper
 from imitation.util import logger as imit_logger
 from imitation.util import networks, util
-
-import wandb
-from wandb.integration.sb3 import WandbCallback
 
 
 class TrajectoryGenerator(abc.ABC):
@@ -95,6 +95,126 @@ class TrajectoryGenerator(abc.ABC):
     @logger.setter
     def logger(self, value: imit_logger.HierarchicalLogger):
         self._logger = value
+
+
+class FromVideoTrajectoryGenerator(TrajectoryGenerator):
+    def __init__(
+        self,
+        data_path: AnyPath,
+        minerl_agent,
+        seed: Optional[int] = None,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        super().__init__(custom_logger=custom_logger)
+        self.data_path = data_path
+        self.minerl_agent = minerl_agent
+        self.rng = random.Random(seed)
+
+        # register all videos and json files
+        mp4_file_paths = glob.glob(os.path.join(self.data_path, "*.mp4"))
+        unique_ids = set()
+        for mp4_file_path in mp4_file_paths:
+            basename = os.path.basename(mp4_file_path)
+            if basename.endswith(".mp4"):
+                unique_ids.add(basename[:-4])
+            elif basename.endswith(".jsonl"):
+                unique_ids.add(basename[:-5])
+        self.unique_ids = list(unique_ids)
+        # Create tuples of (video_path, json_path) for each unique_id
+        trajectory_tuples = []
+        for unique_id in self.unique_ids:
+            video_path = os.path.abspath(
+                os.path.join(self.data_path, unique_id + ".mp4"),
+            )
+            json_path = os.path.abspath(
+                os.path.join(self.data_path, unique_id + ".jsonl"),
+            )
+            trajectory_tuples.append((video_path, json_path))
+        self.trajectory_tuples = trajectory_tuples
+
+    def __len__(self):
+        return len(self.unique_ids)
+
+    def sample(self, steps: int) -> Sequence[TrajectoryWithRew]:
+        video_path, json_path = self.rng.choice(self.trajectory_tuples)
+        num_steps = util.get_num_lines(json_path)
+        from_step = self.rng.randint(0, num_steps - steps)
+        to_step = from_step + steps
+        return util.load_trajectory(
+            video_path, json_path, from_step, to_step, self.minerl_agent
+        )
+
+    def sample_specific(
+        self, unique_id: str, from_step: int, to_step: int
+    ) -> Sequence[TrajectoryWithRew]:
+        video_path, json_path = self.trajectory_tuples[self.unique_ids.index(unique_id)]
+        return util.load_trajectory(
+            video_path, json_path, from_step, to_step, self.minerl_agent
+        )
+
+    def select_sample(self, steps: int) -> Tuple[str, int, int]:
+        traj_idx = self.rng.randint(0, len(self.unique_ids) - 1)
+        unique_id = self.unique_ids[traj_idx]
+        _, json_path = self.trajectory_tuples[traj_idx]
+        num_steps = util.get_num_lines(json_path)
+        from_step = self.rng.randint(0, num_steps - steps)
+        to_step = from_step + steps
+        return unique_id, from_step, to_step
+
+
+class AutoPreferenceDataset(th.utils.data.Dataset):
+    """A PyTorch Dataset for loading preference comparisons on the fly.
+
+    Each item is a tuple consisting of two trajectory fragments
+    and a probability that fragment 1 is preferred over fragment 2.
+
+    This dataset is generating trajectory fragments from two sources
+    one of which is always preferred.
+    """
+
+    def __init__(
+        self,
+        first_source: TrajectoryGenerator,
+        second_source: TrajectoryGenerator,
+        fragment_length: int,
+        first_preferred: Optional[bool] = True,
+        seed: Optional[int] = None,
+    ):
+        """Builds an empty AutoPreferenceDataset"""
+        self.first_source = first_source
+        self.second_source = second_source
+        self.fragment_length = fragment_length
+        self.first_preferred = first_preferred
+        self.seed = seed
+
+        self.fragments1: List[Tuple[str, int, int]] = []
+        self.fragments2: List[Tuple[str, int, int]] = []
+
+    def push(self, num_samples: int = 1):
+        """Add more samples to the dataset"""
+        for _ in range(num_samples):
+            fragment1 = self.first_source.select_sample(self.fragment_length)
+            fragment2 = self.second_source.select_sample(self.fragment_length)
+            self.fragments1.append(fragment1)
+            self.fragments2.append(fragment2)
+
+    def __getitem__(self, i) -> Tuple[TrajectoryWithRewPair, float]:
+        first_traj = self.first_source.sample_specific(*self.fragments1[i])
+        second_traj = self.second_source.sample_specific(*self.fragments2[i])
+        return (first_traj, second_traj), 1.0 if self.first_preferred else 0.0
+
+    def __len__(self) -> int:
+        assert len(self.fragments1) == len(self.fragments2)
+        return len(self.fragments1)
+
+    def save(self, path: AnyPath) -> None:
+        with open(path, "wb") as file:
+            pickle.dump(self, file)
+
+    @staticmethod
+    def load(path: AnyPath) -> "AutoPreferenceDataset":
+        with open(path, "rb") as file:
+            return pickle.load(file)
 
 
 class TrajectoryDataset(TrajectoryGenerator):
@@ -827,7 +947,7 @@ class RandomFragmenter(Fragmenter):
         iterator = iter(fragments)
         return list(zip(iterator, iterator))
 
-    
+
 class MineRLFragmenter(Fragmenter):
     """Sample fragments of trajectories from MineRL envs
     Never query a comparison between fragments of the same trajcetories.
@@ -905,8 +1025,10 @@ class MineRLFragmenter(Fragmenter):
 
         # we need two fragments for each comparison
         for _ in range(num_pairs):
-            trajs = util.weighted_sample_without_replacement(trajectories, weights, 2, rng=self.rng)
-            #trajs = self.rng.sample(trajectories, weights, k=2)
+            trajs = util.weighted_sample_without_replacement(
+                trajectories, weights, 2, rng=self.rng
+            )
+            # trajs = self.rng.sample(trajectories, weights, k=2)
             n1 = len(trajs[0])
             n2 = len(trajs[1])
             start1 = n1 - fragment_length
@@ -918,23 +1040,24 @@ class MineRLFragmenter(Fragmenter):
             fragment1 = TrajectoryWithRew(
                 obs=trajs[0].obs[start1 : end1 + 1],
                 acts=trajs[0].acts[start1:end1],
-                infos=trajs[0].infos[start1:end1] if trajs[0].infos is not None else None,
+                infos=trajs[0].infos[start1:end1]
+                if trajs[0].infos is not None
+                else None,
                 rews=trajs[0].rews[start1:end1],
                 terminal=terminal1,
             )
             fragment2 = TrajectoryWithRew(
                 obs=trajs[1].obs[start2 : end2 + 1],
                 acts=trajs[1].acts[start2:end2],
-                infos=trajs[1].infos[start2:end2] if trajs[1].infos is not None else None,
+                infos=trajs[1].infos[start2:end2]
+                if trajs[1].infos is not None
+                else None,
                 rews=trajs[1].rews[start2:end2],
                 terminal=terminal2,
             )
             fragments1.append(fragment1)
             fragments2.append(fragment2)
         return list(zip(fragments1, fragments2))
-
-
-
 
 
 class ActiveSelectionFragmenter(Fragmenter):
@@ -1273,9 +1396,9 @@ class PrefCollectGatherer(PreferenceGatherer):
             frames = []
             for i in range(len(fragment.infos)):
                 frames.append(fragment.infos[i]["original_obs"]["pov"])
-                #del fragment.infos[i]["original_obs"]
+                # del fragment.infos[i]["original_obs"]
         else:
-           #self.logger.log("'original_obs' not in infos dict.")
+            # self.logger.log("'original_obs' not in infos dict.")
             frames = fragment.obs
 
         for frame in frames:
@@ -1918,7 +2041,9 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             # (but allows for fragments missing terminal timesteps).
             horizons = (len(traj) for traj in trajectories if traj.terminal)
             self._check_fixed_horizon(horizons)
-            self.logger.log(f"Creating fragment pairs from {len(trajectories)} trajectories.")
+            self.logger.log(
+                f"Creating fragment pairs from {len(trajectories)} trajectories."
+            )
             fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs)
             with self.logger.accumulate_means("preferences"):
                 self.logger.log("Gathering preferences")

@@ -1,11 +1,16 @@
 """Miscellaneous utility methods."""
 
+
 import datetime
 import functools
 import itertools
+import json
 import os
 import random
+import shutil
+import subprocess
 import uuid
+from tempfile import mkdtemp
 from typing import (
     Any,
     Callable,
@@ -14,21 +19,21 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Tuple,
     TypeVar,
     Union,
-    Tuple,
 )
-import subprocess
-import shutil
-from tempfile import mkdtemp
-from PIL import Image
 
+import cv2
 import gym
 import numpy as np
 import torch as th
 from gym.wrappers import TimeLimit
+from PIL import Image
 from stable_baselines3.common import monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
+
+from imitation.data.types import AnyPath, TrajectoryWithRew
 
 
 def oric(x: np.ndarray) -> np.ndarray:
@@ -362,3 +367,382 @@ def weighted_sample_without_replacement(population, weights, k, rng=random):
     v = [rng.random() ** (1 / w) for w in weights]
     order = sorted(range(len(population)), key=lambda i: v[i])
     return [population[i] for i in order[-k:]]
+
+
+AGENT_RESOLUTION = (128, 128)
+ACTION_SIZE = (121, 8641)
+
+
+CURSOR_FILE = os.path.join(os.getcwd(), "cursors", "mouse_cursor_white_16x16.png")
+
+# Mapping from JSON keyboard buttons to MineRL actions
+KEYBOARD_BUTTON_MAPPING = {
+    "key.keyboard.escape": "ESC",
+    "key.keyboard.s": "back",
+    "key.keyboard.q": "drop",
+    "key.keyboard.w": "forward",
+    "key.keyboard.1": "hotbar.1",
+    "key.keyboard.2": "hotbar.2",
+    "key.keyboard.3": "hotbar.3",
+    "key.keyboard.4": "hotbar.4",
+    "key.keyboard.5": "hotbar.5",
+    "key.keyboard.6": "hotbar.6",
+    "key.keyboard.7": "hotbar.7",
+    "key.keyboard.8": "hotbar.8",
+    "key.keyboard.9": "hotbar.9",
+    "key.keyboard.e": "inventory",
+    "key.keyboard.space": "jump",
+    "key.keyboard.a": "left",
+    "key.keyboard.d": "right",
+    "key.keyboard.left.shift": "sneak",
+    "key.keyboard.left.control": "sprint",
+    "key.keyboard.f": "swapHands",
+}
+
+
+# Template action
+NOOP_ACTION = {
+    "ESC": 0,
+    "back": 0,
+    "drop": 0,
+    "forward": 0,
+    "hotbar.1": 0,
+    "hotbar.2": 0,
+    "hotbar.3": 0,
+    "hotbar.4": 0,
+    "hotbar.5": 0,
+    "hotbar.6": 0,
+    "hotbar.7": 0,
+    "hotbar.8": 0,
+    "hotbar.9": 0,
+    "inventory": 0,
+    "jump": 0,
+    "left": 0,
+    "right": 0,
+    "sneak": 0,
+    "sprint": 0,
+    "swapHands": 0,
+    "camera": np.array([0, 0]),
+    "attack": 0,
+    "use": 0,
+    "pickItem": 0,
+}
+
+MINEREC_ORIGINAL_HEIGHT_PX = 720
+# Matches a number in the MineRL Java code
+# search the code Java code for "constructMouseState"
+# to find explanations
+CAMERA_SCALER = 360.0 / 2400.0
+
+# If GUI is open, mouse dx/dy need also be adjusted with these scalers.
+# If data version is not present, assume it is 1.
+MINEREC_VERSION_SPECIFIC_SCALERS = {
+    "5.7": 0.5,
+    "5.8": 0.5,
+    "6.7": 2.0,
+    "6.8": 2.0,
+    "6.9": 2.0,
+}
+
+
+INV_KEYBOARD_BUTTON_MAPPING = {v: k for k, v in KEYBOARD_BUTTON_MAPPING.items()}
+
+
+def resize_image(img, target_resolution):
+    # For your sanity, do not resize with any function than INTER_LINEAR
+    img = cv2.resize(img, target_resolution, interpolation=cv2.INTER_LINEAR)
+    return img
+
+
+def env_action_to_json_action(env_action, prev_json_action=None):
+    """
+    Converts a MineRL action into a json action.
+    Requires information from previous json action.
+    Returns json_action
+    """
+    json_action = {}
+    json_action["keyboard"] = {}
+    json_action["keyboard"]["keys"] = []
+    json_action["keyboard"]["newKeys"] = []
+    json_action["mouse"] = {}
+    json_action["mouse"]["buttons"] = []
+    json_action["mouse"]["newButtons"] = []
+    json_action["hotbar"] = 0
+    json_action["tick"] = prev_json_action["tick"] + 1 if prev_json_action else 0
+
+    # determine whether GUI is open
+    e_pressed = (
+        "key.keyboard.e" in prev_json_action["keyboard"]["keys"]
+        if prev_json_action
+        else False
+    )
+    prev_gui_open = prev_json_action["isGuiOpen"] if prev_json_action else False
+    json_action["isGuiOpen"] = e_pressed != prev_gui_open
+
+    # process keyboard actions
+    for key, json_key in INV_KEYBOARD_BUTTON_MAPPING.items():
+        if key in env_action and env_action[key] == 1:
+            json_action["keyboard"]["keys"].append(
+                json_key,
+            )
+
+            # track newly pressed keys
+            if (
+                prev_json_action
+                and json_key not in prev_json_action["keyboard"]["keys"]
+            ):
+                json_action["keyboard"]["newKeys"].append(json_key)
+
+            # update hotbar entry (note: we can't update based on mouse wheel)
+            if key.startswith("hotbar"):
+                json_action["hotbar"] = int(key.split(".")[1]) - 1
+
+    # process mouse actions
+    camera_action = env_action["camera"][0]
+    json_action["mouse"]["dy"] = round(camera_action[0] / CAMERA_SCALER)
+    json_action["mouse"]["dx"] = round(camera_action[1] / CAMERA_SCALER)
+    json_action["mouse"]["x"] = (
+        prev_json_action["mouse"]["x"] + prev_json_action["mouse"]["dx"]
+        if prev_json_action
+        else 640.0
+    )
+    json_action["mouse"]["y"] = (
+        prev_json_action["mouse"]["y"] + prev_json_action["mouse"]["dy"]
+        if prev_json_action
+        else 360.0
+    )
+
+    buttons = ["attack", "use", "pickItem"]
+    for i, button in enumerate(buttons):
+        if button in env_action and env_action[button] == 1:
+            json_action["mouse"]["buttons"].append(i)
+            # track newly pressed buttons
+            if prev_json_action and i not in prev_json_action["mouse"]["buttons"]:
+                json_action["mouse"]["newButtons"].append(i)
+
+    return json_action
+
+
+def json_action_to_env_action(json_action):
+    """
+    Converts a json action into a MineRL action.
+    Returns (minerl_action, is_null_action)
+    """
+    # This might be slow...
+    env_action = NOOP_ACTION.copy()
+    # As a safeguard, make camera action again so we do not override anything
+    env_action["camera"] = np.array([0, 0])
+
+    is_null_action = True
+    keyboard_keys = json_action["keyboard"]["keys"]
+    for key in keyboard_keys:
+        # You can have keys that we do not use, so just skip them
+        # NOTE in original training code, ESC was removed and replaced with
+        #      "inventory" action if GUI was open.
+        #      Not doing it here, as BASALT uses ESC to quit the game.
+        if key in KEYBOARD_BUTTON_MAPPING:
+            env_action[KEYBOARD_BUTTON_MAPPING[key]] = 1
+            is_null_action = False
+
+    mouse = json_action["mouse"]
+    camera_action = env_action["camera"]
+    camera_action[0] = mouse["dy"] * CAMERA_SCALER
+    camera_action[1] = mouse["dx"] * CAMERA_SCALER
+
+    if mouse["dx"] != 0 or mouse["dy"] != 0:
+        is_null_action = False
+    else:
+        if abs(camera_action[0]) > 180:
+            camera_action[0] = 0
+        if abs(camera_action[1]) > 180:
+            camera_action[1] = 0
+
+    mouse_buttons = mouse["buttons"]
+    if 0 in mouse_buttons:
+        env_action["attack"] = 1
+        is_null_action = False
+    if 1 in mouse_buttons:
+        env_action["use"] = 1
+        is_null_action = False
+    if 2 in mouse_buttons:
+        env_action["pickItem"] = 1
+        is_null_action = False
+
+    return env_action, is_null_action
+
+
+def composite_images_with_alpha(image1, image2, alpha, x, y):
+    """
+    Draw image2 over image1 at location x,y, using alpha as the opacity for image2.
+
+    Modifies image1 in-place
+    """
+    ch = max(0, min(image1.shape[0] - y, image2.shape[0]))
+    cw = max(0, min(image1.shape[1] - x, image2.shape[1]))
+    if ch == 0 or cw == 0:
+        return
+    alpha = alpha[:ch, :cw]
+    image1[y : y + ch, x : x + cw, :] = (
+        image1[y : y + ch, x : x + cw, :] * (1 - alpha) + image2[:ch, :cw, :] * alpha
+    ).astype(np.uint8)
+
+
+def get_num_lines(path: AnyPath):
+    with open(path) as file:
+        num_lines = len(file.readlines())
+    return num_lines
+
+
+def load_jsonl(json_path: AnyPath):
+    with open(json_path) as json_file:
+        json_lines = json_file.readlines()
+        json_data = "[" + ",".join(json_lines) + "]"
+        json_data = json.loads(json_data)
+    return json_data
+
+
+def process_frame(frame, action, cursor_image, cursor_alpha):
+    if action["isGuiOpen"]:
+        camera_scaling_factor = frame.shape[0] / MINEREC_ORIGINAL_HEIGHT_PX
+        cursor_x = int(action["mouse"]["x"] * camera_scaling_factor)
+        cursor_y = int(action["mouse"]["y"] * camera_scaling_factor)
+        composite_images_with_alpha(
+            frame, cursor_image, cursor_alpha, cursor_x, cursor_y
+        )
+    cv2.cvtColor(frame, code=cv2.COLOR_BGR2RGB, dst=frame)
+    pov_frame = np.asarray(np.clip(frame, 0, 255), dtype=np.uint8)
+    agent_frame = resize_image(pov_frame, AGENT_RESOLUTION)
+    return pov_frame, agent_frame
+
+
+def load_trajectory(
+    video_path: AnyPath,
+    json_path: AnyPath,
+    from_step: int,
+    to_step: int,
+    minerl_agent,
+    pov_to_infos: bool = False,
+) -> TrajectoryWithRew:
+    # TODO preprocess actions: convert dict to multidiscrete
+    """
+    Load trajectories from data files for the data loader.
+    """
+
+    cursor_image = cv2.imread(CURSOR_FILE, cv2.IMREAD_UNCHANGED)
+    # Assume 16x16
+    cursor_image = cursor_image[:16, :16, :]
+    cursor_alpha = cursor_image[:, :, 3:] / 255.0
+    cursor_image = cursor_image[:, :, :3]
+
+    video = cv2.VideoCapture(video_path)
+    # Note: In some recordings, the game seems to start
+    #       with attack always down from the beginning, which
+    #       is stuck down until player actually presses attack
+    attack_is_stuck = False
+    # Scrollwheel is allowed way to change items, but this is
+    # not captured by the recorder.
+    # Work around this by keeping track of selected hotbar item
+    # and updating "hotbar.#" actions when hotbar selection changes.
+    last_hotbar = 0
+
+    json_data = load_jsonl(json_path)
+
+    # relevant containers for constructing trajectory
+    traj_length = to_step - from_step
+
+    obs = np.empty((traj_length + 1, *AGENT_RESOLUTION, 3))
+    acts = np.empty((traj_length, 2))
+    rews = np.zeros((traj_length,))
+    infos = np.empty((traj_length,), dtype=object) if pov_to_infos else None
+
+    terminal = False
+    if to_step == len(json_data):
+        terminal = True
+
+    step_counter = 0
+    for i in range(len(json_data)):
+        # do not procecss more video than needed
+        if i >= to_step:
+            break
+
+        # Processing action
+        step_data = json_data[i]
+
+        if i == 0:
+            # Check if attack will be stuck down
+            if step_data["mouse"]["newButtons"] == [0]:
+                attack_is_stuck = True
+        elif attack_is_stuck:
+            # Check if we press attack down, then it might not be stuck
+            if 0 in step_data["mouse"]["newButtons"]:
+                attack_is_stuck = False
+        # If still stuck, remove the action
+        if attack_is_stuck:
+            step_data["mouse"]["buttons"] = [
+                button for button in step_data["mouse"]["buttons"] if button != 0
+            ]
+
+        action, is_null_action = json_action_to_env_action(step_data)
+
+        # Update hotbar selection
+        current_hotbar = step_data["hotbar"]
+        if current_hotbar != last_hotbar:
+            action["hotbar.{}".format(current_hotbar + 1)] = 1
+        last_hotbar = current_hotbar
+
+        # Read frame even if this is null so we progress forward
+        ret, frame = video.read()
+
+        # skip saving items before the selected range
+        if i < from_step:
+            continue
+
+        if ret:
+            # Convert action to ndarray and save
+            agent_action = minerl_agent._env_action_to_agent(action)
+            array_action = np.concatenate(
+                (agent_action["camera"], agent_action["buttons"]), -1
+            ).squeeze(0)
+            acts[step_counter, ...] = array_action
+
+            # Prepocess frame and save
+            pov_frame, agent_frame = process_frame(
+                frame, step_data, cursor_image, cursor_alpha
+            )
+            if pov_to_infos:
+                # add original frame to infos
+                infos["orig_observation"] = pov_frame
+            # add downsampled frame to obs
+            obs[step_counter, ...] = agent_frame
+            step_counter += 1
+        else:
+            raise ValueError(f"Could not read frame {i} from video {video_path}")
+
+    # we need one more frame than actions / transitions
+    ret, frame = video.read()
+    if ret:
+        if i + 1 < len(json_data):
+            step_data = json_data[i + 1]
+        else:
+            step_data = {"isGuiOpen": False}
+        # Prepocess frame and save
+        pov_frame, agent_frame = process_frame(
+            frame, step_data, cursor_alpha, cursor_alpha
+        )
+        if pov_to_infos:
+            # add original frame to infos
+            infos["orig_observation"] = pov_frame
+        # add downsampled frame to obs
+        obs[step_counter, ...] = agent_frame
+    else:
+        raise ValueError(f"Could not read frame {i + 1} from video {video_path}")
+
+    video.release()
+
+    return TrajectoryWithRew(
+        obs=obs,
+        acts=acts,
+        infos=infos,
+        rews=rews,
+        terminal=terminal,
+    )
