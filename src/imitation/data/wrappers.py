@@ -228,7 +228,9 @@ class MineRLBufferingWrapper(VecEnvWrapper):
         for info in orig_infos:
             new_info = info.copy()
             if "terminal_observation" in info:
-                new_info["terminal_observation"] = info["terminal_observation"]["img"].numpy().squeeze(0)
+                new_info["terminal_observation"] = (
+                    info["terminal_observation"]["img"].numpy().squeeze(0)
+                )
             new_infos.append(new_info)
         new_infos = np.stack(new_infos, axis=0)
 
@@ -242,7 +244,7 @@ class MineRLBufferingWrapper(VecEnvWrapper):
         self._trajectories.extend(finished_trajs)
 
         # Pass accumulated trajectories into the infos dict
-        # which is required by 
+        # which is required by
         # generate_trajectories_via_bufferingwrapper
         for info in orig_infos:
             info["finished_trajs"] = finished_trajs
