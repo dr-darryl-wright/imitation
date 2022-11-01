@@ -157,6 +157,10 @@ class FromVideoTrajectoryGenerator(TrajectoryGenerator):
         unique_id = self.unique_ids[traj_idx]
         _, json_path = self.trajectory_tuples[traj_idx]
         num_steps = util.get_num_lines(json_path)
+        if num_steps <= steps:
+            raise ValueError(
+                f"Trajectory {unique_id} is shorter than requested number of steps: {steps}"
+            )
         from_step = self.rng.randint(0, num_steps - steps)
         to_step = from_step + steps
         return unique_id, from_step, to_step
@@ -193,14 +197,23 @@ class AutoPreferenceDataset(th.utils.data.Dataset):
     def push(self, num_samples: int = 1):
         """Add more samples to the dataset"""
         for _ in range(num_samples):
-            fragment1 = self.first_source.select_sample(self.fragment_length)
-            fragment2 = self.second_source.select_sample(self.fragment_length)
+            try:
+                fragment1 = self.first_source.select_sample(self.fragment_length)
+            except ValueError as e:
+                print(f"Failed to sample from {self.first_source.data_path}: {str(e)}")
+            try:
+                fragment2 = self.second_source.select_sample(self.fragment_length)
+            except ValueError as e:
+                print(f"Failed to sample from {self.second_source.data_path}: {str(e)}")
             self.fragments1.append(fragment1)
             self.fragments2.append(fragment2)
 
     def __getitem__(self, i) -> Tuple[TrajectoryWithRewPair, float]:
-        first_traj = self.first_source.sample_specific(*self.fragments1[i])
-        second_traj = self.second_source.sample_specific(*self.fragments2[i])
+        try:
+            first_traj = self.first_source.sample_specific(*self.fragments1[i])
+            second_traj = self.second_source.sample_specific(*self.fragments2[i])
+        except ValueError:
+            return None
         return (first_traj, second_traj), 1.0 if self.first_preferred else 0.0
 
     def __len__(self) -> int:
@@ -798,7 +811,9 @@ class PreferenceModel(nn.Module):
         if self.discount_factor == 1:
             returns_diff = (rews2 - rews1).sum(axis=0)
         else:
-            discounts = self.discount_factor ** th.arange(len(rews1))
+            discounts = self.discount_factor ** th.arange(len(rews1)).to(
+                self.model.device
+            )
             if self.is_ensemble:
                 discounts = discounts.reshape(-1, 1)
             returns_diff = (discounts * (rews2 - rews1)).sum(axis=0)
@@ -1509,6 +1524,8 @@ class PreferenceDataset(th.utils.data.Dataset):
 def preference_collate_fn(
     batch: Sequence[Tuple[TrajectoryWithRewPair, float]],
 ) -> Tuple[Sequence[TrajectoryWithRewPair], np.ndarray]:
+    # Filter out damaged trajectories
+    batch = list(filter(lambda x: x is not None, batch))
     fragment_pairs, preferences = zip(*batch)
     return list(fragment_pairs), np.array(preferences)
 
@@ -1698,8 +1715,10 @@ class BasicRewardTrainer(RewardTrainer):
         dataloader = self._make_data_loader(dataset)
         epochs = round(self.epochs * epoch_multiplier)
 
-        for _ in tqdm(range(epochs), desc="Training reward model"):
-            for fragment_pairs, preferences in dataloader:
+        for ep in tqdm(range(epochs), desc="Training reward model"):
+            for fragment_pairs, preferences in tqdm(
+                dataloader, desc=f"Training epoch {ep + 1}"
+            ):
                 self.optim.zero_grad()
                 loss = self._training_inner_loop(fragment_pairs, preferences)
                 loss.backward()
