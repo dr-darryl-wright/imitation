@@ -163,7 +163,7 @@ class FromVideoTrajectoryGenerator(TrajectoryGenerator):
             )
         from_step = self.rng.randint(0, num_steps - steps)
         to_step = from_step + steps
-        return unique_id, from_step, to_step
+        return unique_id, from_step, to_step, num_steps
 
 
 class AutoPreferenceDataset(th.utils.data.Dataset):
@@ -182,6 +182,7 @@ class AutoPreferenceDataset(th.utils.data.Dataset):
         second_source: TrajectoryGenerator,
         fragment_length: int,
         first_preferred: Optional[bool] = True,
+        later_fragments_preferred: Optional[bool] = False,
         seed: Optional[int] = None,
     ):
         """Builds an empty AutoPreferenceDataset"""
@@ -189,10 +190,11 @@ class AutoPreferenceDataset(th.utils.data.Dataset):
         self.second_source = second_source
         self.fragment_length = fragment_length
         self.first_preferred = first_preferred
+        self.later_fragments_preferred = later_fragments_preferred
         self.seed = seed
 
-        self.fragments1: List[Tuple[str, int, int]] = []
-        self.fragments2: List[Tuple[str, int, int]] = []
+        self.fragments1: List[Tuple[str, int, int, int]] = []
+        self.fragments2: List[Tuple[str, int, int, int]] = []
 
     def push(self, num_samples: int = 1):
         """Add more samples to the dataset"""
@@ -214,7 +216,17 @@ class AutoPreferenceDataset(th.utils.data.Dataset):
             second_traj = self.second_source.sample_specific(*self.fragments2[i])
         except ValueError:
             return None
-        return (first_traj, second_traj), 1.0 if self.first_preferred else 0.0
+        if self.later_fragments_preferred:
+            _, from_step, to_step, num_steps = (
+                self.fragments1[i] if self.first_preferred else self.fragments2[i]
+            )
+            # TODO allow custom schedule
+            # increase probability of preference towards end of trajectory
+            pref = 0.5 * (1 + math.sqrt(to_step / num_steps))
+            pref = pref if self.first_preferred else 1 - pref
+        else:
+            pref = 1.0 if self.first_preferred else 0.0
+        return (first_traj, second_traj), pref
 
     def __len__(self) -> int:
         assert len(self.fragments1) == len(self.fragments2)
