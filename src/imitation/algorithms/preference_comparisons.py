@@ -29,6 +29,7 @@ import torch as th
 import wandb
 from scipy import special
 from stable_baselines3.common import base_class, type_aliases, utils, vec_env
+from stable_baselines3.common.vec_env import VecMonitor
 from torch import nn
 from torch.utils import data as data_th
 from tqdm.auto import tqdm
@@ -327,6 +328,7 @@ class MineRLAgentTrainer(TrajectoryGenerator):
             self.buffering_wrapper,
             reward_fn=self.reward_fn,
         )
+        self.venv = VecMonitor(self.venv)
 
         self.log_callback = [self.reward_venv_wrapper.make_log_callback()]
         if wandb.run is not None:
