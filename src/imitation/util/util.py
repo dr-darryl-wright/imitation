@@ -33,7 +33,7 @@ from PIL import Image
 from stable_baselines3.common import monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 
-from imitation.data.types import AnyPath, TrajectoryWithRew
+from imitation.data.types import AnyPath, Trajectory
 
 
 def oric(x: np.ndarray) -> np.ndarray:
@@ -478,6 +478,7 @@ def env_action_to_json_action(env_action, prev_json_action=None):
     )
     prev_gui_open = prev_json_action["isGuiOpen"] if prev_json_action else False
     json_action["isGuiOpen"] = e_pressed != prev_gui_open
+    gui_was_opened_or_closed = prev_gui_open != json_action["isGuiOpen"]
 
     # process keyboard actions
     for key, json_key in INV_KEYBOARD_BUTTON_MAPPING.items():
@@ -497,20 +498,27 @@ def env_action_to_json_action(env_action, prev_json_action=None):
             if key.startswith("hotbar"):
                 json_action["hotbar"] = int(key.split(".")[1]) - 1
 
-    # process mouse actions
-    camera_action = env_action["camera"][0]
-    json_action["mouse"]["dy"] = round(camera_action[0] / CAMERA_SCALER)
-    json_action["mouse"]["dx"] = round(camera_action[1] / CAMERA_SCALER)
-    json_action["mouse"]["x"] = (
-        prev_json_action["mouse"]["x"] + prev_json_action["mouse"]["dx"]
-        if prev_json_action
-        else 640.0
-    )
-    json_action["mouse"]["y"] = (
-        prev_json_action["mouse"]["y"] + prev_json_action["mouse"]["dy"]
-        if prev_json_action
-        else 360.0
-    )
+    if gui_was_opened_or_closed:
+        # reset mouse coords
+        json_action["mouse"]["x"] = 640.0
+        json_action["mouse"]["y"] = 360.0
+    else:
+        # normal mouse coord update
+        json_action["mouse"]["x"] = (
+            prev_json_action["mouse"]["x"] + prev_json_action["mouse"]["dx"]
+            if prev_json_action
+            else 640.0
+        )
+        json_action["mouse"]["y"] = (
+            prev_json_action["mouse"]["y"] + prev_json_action["mouse"]["dy"]
+            if prev_json_action
+            else 360.0
+        )
+
+    # make sure coordinates are not out of bounds when GUI is open
+    if json_action["isGuiOpen"]:
+        json_action["mouse"]["x"] = max(0.0, min(json_action["mouse"]["x"], 640.0))
+        json_action["mouse"]["y"] = max(0.0, min(json_action["mouse"]["x"], 360.0))
 
     buttons = ["attack", "use", "pickItem"]
     for i, button in enumerate(buttons):
@@ -622,8 +630,7 @@ def load_trajectory(
     to_step: int,
     minerl_agent,
     pov_to_infos: bool = False,
-) -> TrajectoryWithRew:
-    # TODO preprocess actions: convert dict to multidiscrete
+) -> Trajectory:
     """
     Load trajectories from data files for the data loader.
     """
@@ -652,7 +659,6 @@ def load_trajectory(
 
     obs = np.empty((traj_length + 1, *AGENT_RESOLUTION, 3))
     acts = np.empty((traj_length, 2))
-    rews = np.zeros((traj_length,))
     infos = np.empty((traj_length,), dtype=object) if pov_to_infos else None
 
     terminal = False
@@ -739,10 +745,9 @@ def load_trajectory(
 
     video.release()
 
-    return TrajectoryWithRew(
+    return Trajectory(
         obs=obs,
         acts=acts,
         infos=infos,
-        rews=rews,
         terminal=terminal,
     )
