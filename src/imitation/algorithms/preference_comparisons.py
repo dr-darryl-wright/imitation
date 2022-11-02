@@ -213,8 +213,8 @@ class AutoPreferenceDataset(th.utils.data.Dataset):
 
     def __getitem__(self, i) -> Tuple[TrajectoryWithRewPair, float]:
         try:
-            first_traj = self.first_source.sample_specific(*self.fragments1[i])
-            second_traj = self.second_source.sample_specific(*self.fragments2[i])
+            first_traj = self.first_source.sample_specific(*self.fragments1[i][:-1])
+            second_traj = self.second_source.sample_specific(*self.fragments2[i][:-1])
         except ValueError:
             return None
         if self.later_fragments_preferred:
