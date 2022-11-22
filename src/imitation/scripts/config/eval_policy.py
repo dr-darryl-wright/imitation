@@ -2,11 +2,11 @@
 
 import sacred
 
-from imitation.scripts.common import common
+from imitation.scripts.common import common, expert
 
 eval_policy_ex = sacred.Experiment(
     "eval_policy",
-    ingredients=[common.common_ingredient],
+    ingredients=[common.common_ingredient, expert.expert_ingredient],
 )
 
 
@@ -20,13 +20,19 @@ def replay_defaults():
     render = False  # render to screen
     render_fps = 60  # -1 to render at full speed
 
-    policy_type = None  # class to load policy, see imitation.policies.loader
-    policy_path = None  # path to serialized policy
-
     reward_type = None  # Optional: override with reward of this type
     reward_path = None  # Path of serialized reward to load
 
     rollout_save_path = None  # where to save rollouts to -- if None, do not save
+
+    explore_kwargs = (
+        None  # kwargs to feed to ExplorationWrapper -- if None, do not wrap
+    )
+
+
+@eval_policy_ex.named_config
+def explore_eps_greedy():
+    explore_kwargs = dict(switch_prob=1.0, random_prob=0.1)
 
 
 @eval_policy_ex.named_config
@@ -58,6 +64,11 @@ def seals_cartpole():
 @eval_policy_ex.named_config
 def half_cheetah():
     common = dict(env_name="HalfCheetah-v2")
+
+
+@eval_policy_ex.named_config
+def seals_half_cheetah():
+    common = dict(env_name="seals/HalfCheetah-v0")
 
 
 @eval_policy_ex.named_config
@@ -107,9 +118,7 @@ def seals_walker():
 
 @eval_policy_ex.named_config
 def fast():
-    common = dict(env_name="CartPole-v1", num_vec=1, parallel=False)
+    common = dict(env_name="seals/CartPole-v0", num_vec=1, parallel=False)
     render = True
-    policy_type = "ppo"
-    policy_path = "tests/testdata/expert_models/cartpole_0/policies/final/"
     eval_n_timesteps = 1
     eval_n_episodes = None

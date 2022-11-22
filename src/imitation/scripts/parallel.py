@@ -2,8 +2,8 @@
 
 import collections.abc
 import copy
-import os
-from typing import Any, Callable, Mapping, Optional, Sequence
+import pathlib
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 import ray
 import ray.tune
@@ -87,19 +87,6 @@ def parallel(
     base_config_updates = copy.deepcopy(base_config_updates)
     search_space = copy.deepcopy(search_space)
 
-    # Explicitly set `data_dir` if parallelizing `train_adversarial`. We need this to
-    # automatically find rollout pickles because Ray sets a new working directory for
-    # each Raylet.
-    if sacred_ex_name == "train_adversarial":
-        no_data_dir = (
-            "demonstrations.data_dir" not in base_config_updates
-            and "data_dir" not in base_config_updates.get("demonstrations", {})
-        )
-        if no_data_dir:
-            data_dir = os.path.join(os.getcwd(), "data/")
-            base_config_updates = dict(base_config_updates)
-            base_config_updates["demonstrations.data_dir"] = data_dir
-
     trainable = _ray_tune_sacred_wrapper(
         sacred_ex_name,
         run_name,
@@ -178,7 +165,7 @@ def _ray_tune_sacred_wrapper(
         sacred.SETTINGS.CAPTURE_MODE = "sys"
 
         run_kwargs = config
-        updated_run_kwargs = {}
+        updated_run_kwargs: Dict[str, Any] = {}
         # Import inside function rather than in module because Sacred experiments
         # are not picklable, and Ray requires this function to be picklable.
         from imitation.scripts.train_adversarial import train_adversarial_ex
@@ -192,14 +179,10 @@ def _ray_tune_sacred_wrapper(
         ex.observers = [FileStorageObserver("sacred")]
 
         # Apply base configs to get modified `named_configs` and `config_updates`.
-        named_configs = []
-        named_configs.extend(base_named_configs)
-        named_configs.extend(run_kwargs["named_configs"])
+        named_configs = base_named_configs + run_kwargs["named_configs"]
         updated_run_kwargs["named_configs"] = named_configs
 
-        config_updates = {}
-        config_updates.update(base_config_updates)
-        config_updates.update(run_kwargs["config_updates"])
+        config_updates = {**base_config_updates, **run_kwargs["config_updates"]}
         updated_run_kwargs["config_updates"] = config_updates
 
         # Add other run_kwargs items to updated_run_kwargs.
@@ -220,7 +203,8 @@ def _ray_tune_sacred_wrapper(
 
 
 def main_console():
-    observer = FileStorageObserver(os.path.join("output", "sacred", "parallel"))
+    observer_path = pathlib.Path.cwd() / "output" / "sacred" / "parallel"
+    observer = FileStorageObserver(observer_path)
     parallel_ex.observers.append(observer)
     parallel_ex.run_commandline()
 

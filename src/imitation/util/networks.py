@@ -1,9 +1,9 @@
 """Helper methods to build and run neural networks."""
+import abc
 import collections
 import contextlib
 import functools
-from abc import ABC, abstractclassmethod
-from typing import Iterable, Optional, Type, Union
+from typing import Dict, Iterable, Optional, Type, Union
 
 import torch as th
 from torch import nn
@@ -44,7 +44,7 @@ class SqueezeLayer(nn.Module):
         return new_value
 
 
-class BaseNorm(nn.Module, ABC):
+class BaseNorm(nn.Module, abc.ABC):
     """Base class for layers that try to normalize the input to mean 0 and variance 1.
 
     Similar to BatchNorm, LayerNorm, etc. but whereas they only use statistics from
@@ -88,7 +88,7 @@ class BaseNorm(nn.Module, ABC):
 
         return (x - self.running_mean) / th.sqrt(self.running_var + self.eps)
 
-    @abstractclassmethod
+    @abc.abstractmethod
     def update_stats(self, batch: th.Tensor) -> None:
         """Update `self.running_mean`, `self.running_var` and `self.count`."""
 
@@ -145,7 +145,7 @@ class EMANorm(BaseNorm):
 
         Args:
             num_features: Number of features; the length of the non-batch dim.
-            decay: how quickly the weight on past samples decays over time
+            decay: how quickly the weight on past samples decays over time.
             eps: small constant for numerical stability.
 
         Raises:
@@ -193,7 +193,7 @@ class EMANorm(BaseNorm):
         self.running_var += learning_rate * delta_var
 
         self.count += b_size
-        self.num_batches += 1
+        self.num_batches += 1  # type: ignore[misc]
 
 
 def build_mlp(
@@ -214,7 +214,7 @@ def build_mlp(
             shape (batch_size, in_size).
         hid_sizes: sizes of hidden layers. If this is an empty iterable, then we build
             a linear function approximator.
-        out_size: required size of output vector.
+        out_size: size of output vector.
         name: Name to use as a prefix for the layers ID.
         activation: activation to apply after hidden layers.
         dropout_prob: Dropout probability to use after each hidden layer. If 0,
@@ -234,7 +234,7 @@ def build_mlp(
     Raises:
         ValueError: if squeeze_output was supplied with out_size!=1.
     """
-    layers = collections.OrderedDict()
+    layers: Dict[str, nn.Module] = {}
 
     if name is None:
         prefix = ""
@@ -246,7 +246,14 @@ def build_mlp(
 
     # Normalize input layer
     if normalize_input_layer:
-        layers[f"{prefix}normalize_input"] = normalize_input_layer(in_size)
+        try:
+            layer_instance = normalize_input_layer(in_size)  # type: ignore[call-arg]
+        except TypeError as exc:
+            raise ValueError(
+                f"normalize_input_layer={normalize_input_layer} is not a valid "
+                "normalization layer type accepting only one argument (in_size).",
+            ) from exc
+        layers[f"{prefix}normalize_input"] = layer_instance
 
     # Hidden layers
     prev_size = in_size
@@ -266,7 +273,7 @@ def build_mlp(
             raise ValueError("squeeze_output is only applicable when out_size=1")
         layers[f"{prefix}squeeze"] = SqueezeLayer()
 
-    model = nn.Sequential(layers)
+    model = nn.Sequential(collections.OrderedDict(layers))
 
     return model
 
@@ -303,10 +310,11 @@ def build_cnn(
         nn.Module: a CNN mapping from inputs of size (batch_size, in_size, in_height,
             in_width) to (batch_size, out_size), unless out_size=1 and
             squeeze_output=True, in which case the output is of size (batch_size, ).
+
     Raises:
         ValueError: if squeeze_output was supplied with out_size!=1.
     """
-    layers = collections.OrderedDict()
+    layers: Dict[str, nn.Module] = {}
 
     if name is None:
         prefix = ""
@@ -338,5 +346,5 @@ def build_cnn(
             raise ValueError("squeeze_output is only applicable when out_size=1")
         layers[f"{prefix}squeeze"] = SqueezeLayer()
 
-    model = nn.Sequential(layers)
+    model = nn.Sequential(collections.OrderedDict(layers))
     return model

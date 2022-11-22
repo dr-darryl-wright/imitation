@@ -7,24 +7,24 @@ Follows the description in chapters 9 and 10 of Brian Ziebart's `PhD thesis`_.
 """
 import collections
 import warnings
-from typing import Any, Iterable, Mapping, Optional, Tuple, Type, Union
+from typing import Any, Iterable, List, Mapping, NoReturn, Optional, Tuple, Type, Union
 
 import gym
 import numpy as np
 import scipy.special
 import torch as th
+from seals import base_envs
 from stable_baselines3.common import policies
 
 from imitation.algorithms import base
 from imitation.data import rollout, types
-from imitation.envs import resettable_env
 from imitation.rewards import reward_nets
 from imitation.util import logger as imit_logger
 from imitation.util import networks, util
 
 
 def mce_partition_fh(
-    env: resettable_env.TabularModelEnv,
+    env: base_envs.TabularModelPOMDP,
     *,
     reward: Optional[np.ndarray] = None,
     discount: float = 1.0,
@@ -43,11 +43,16 @@ def mce_partition_fh(
         (V, Q, \pi) corresponding to the soft values, Q-values and MCE policy.
         V is a 2d array, indexed V[t,s]. Q is a 3d array, indexed Q[t,s,a].
         \pi is a 3d array, indexed \pi[t,s,a].
+
+    Raises:
+        ValueError: if ``env.horizon`` is None (infinite horizon).
     """
     # shorthand
     horizon = env.horizon
-    n_states = env.n_states
-    n_actions = env.n_actions
+    if horizon is None:
+        raise ValueError("Only finite-horizon environments are supported.")
+    n_states = env.state_dim
+    n_actions = env.action_dim
     T = env.transition_matrix
     if reward is None:
         reward = env.reward_matrix
@@ -77,7 +82,7 @@ def mce_partition_fh(
 
 
 def mce_occupancy_measures(
-    env: resettable_env.TabularModelEnv,
+    env: base_envs.TabularModelPOMDP,
     *,
     reward: Optional[np.ndarray] = None,
     pi: Optional[np.ndarray] = None,
@@ -99,11 +104,16 @@ def mce_occupancy_measures(
         ``(env.horizon, env.n_states)`` and records the probability of being in a
         given state at a given timestep. ``Dcum`` is of shape ``(env.n_states,)``
         and records the expected discounted number of times each state is visited.
+
+    Raises:
+        ValueError: if ``env.horizon`` is None (infinite horizon).
     """
     # shorthand
     horizon = env.horizon
-    n_states = env.n_states
-    n_actions = env.n_actions
+    if horizon is None:
+        raise ValueError("Only finite-horizon environments are supported.")
+    n_states = env.state_dim
+    n_actions = env.action_dim
     T = env.transition_matrix
     if reward is None:
         reward = env.reward_matrix
@@ -141,13 +151,16 @@ def squeeze_r(r_output: th.Tensor) -> th.Tensor:
 class TabularPolicy(policies.BasePolicy):
     """A tabular policy. Cannot be trained -- prediction only."""
 
+    pi: np.ndarray
+    rng: np.random.Generator
+
     def __init__(
         self,
         state_space: gym.Space,
         action_space: gym.Space,
         pi: np.ndarray,
-        rng: Optional[np.random.RandomState],
-    ):
+        rng: np.random.Generator,
+    ) -> None:
         """Builds TabularPolicy.
 
         Args:
@@ -162,8 +175,7 @@ class TabularPolicy(policies.BasePolicy):
         assert isinstance(action_space, gym.spaces.Discrete), "action not tabular"
         # What we call state space here is observation space in SB3 nomenclature.
         super().__init__(observation_space=state_space, action_space=action_space)
-        self.rng = rng or np.random
-        self.pi = None
+        self.rng = rng
         self.set_pi(pi)
 
     def set_pi(self, pi: np.ndarray) -> None:
@@ -176,16 +188,20 @@ class TabularPolicy(policies.BasePolicy):
     def _predict(self, observation: th.Tensor, deterministic: bool = False):
         raise NotImplementedError("Should never be called as predict overridden.")
 
-    def forward(self, observation: th.Tensor, deterministic: bool = False):
-        raise NotImplementedError("Should never be called.")
+    def forward(
+        self,
+        observation: th.Tensor,
+        deterministic: bool = False,
+    ) -> NoReturn:
+        raise NotImplementedError("Should never be called.")  # pragma: no cover
 
     def predict(
         self,
-        observation: np.ndarray,
-        state: Optional[np.ndarray] = None,
-        mask: Optional[np.ndarray] = None,
+        observation: Union[np.ndarray, Mapping[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
         """Predict action to take in given state.
 
         Arguments follow SB3 naming convention as this is an SB3 policy.
@@ -199,36 +215,35 @@ class TabularPolicy(policies.BasePolicy):
         Args:
             observation: States in the underlying MDP.
             state: Hidden states of the policy -- used to represent timesteps by us.
-            mask: Has episode completed?
+            episode_start: Has episode completed?
             deterministic: If true, pick action with highest probability; otherwise,
                 sample.
 
         Returns:
             Tuple of the actions and new hidden states.
         """
-        timesteps = state  # rename to avoid confusion
-        del state
-
-        if timesteps is None:
+        if state is None:
             timesteps = np.zeros(len(observation), dtype=int)
         else:
-            timesteps = np.array(timesteps)
+            assert len(state) == 1
+            timesteps = state[0]
         assert len(timesteps) == len(observation), "timestep and obs batch size differ"
 
-        if mask is not None:
-            timesteps[mask] = 0
+        if episode_start is not None:
+            timesteps[episode_start] = 0
 
-        actions = []
+        actions: List[int] = []
         for obs, t in zip(observation, timesteps):
             assert self.observation_space.contains(obs), "illegal state"
             dist = self.pi[t, obs, :]
             if deterministic:
-                actions.append(dist.argmax())
+                actions.append(int(dist.argmax()))
             else:
                 actions.append(self.rng.choice(len(dist), p=dist))
 
         timesteps += 1  # increment timestep
-        return np.array(actions), timesteps
+        state = (timesteps,)
+        return np.array(actions), state
 
 
 MCEDemonstrations = Union[np.ndarray, base.AnyTransitions]
@@ -252,8 +267,9 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
     def __init__(
         self,
         demonstrations: Optional[MCEDemonstrations],
-        env: resettable_env.TabularModelEnv,
+        env: base_envs.TabularModelPOMDP,
         reward_net: reward_nets.RewardNet,
+        rng: np.random.Generator,
         optimizer_cls: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Mapping[str, Any]] = None,
         discount: float = 1.0,
@@ -262,9 +278,8 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
         # TODO(adam): do we need log_interval or can just use record_mean...?
         log_interval: Optional[int] = 100,
         *,
-        rng: Optional[np.random.RandomState] = None,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
-    ):
+    ) -> None:
         r"""Creates MCE IRL.
 
         Args:
@@ -274,10 +289,11 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
                 The demonstrations must have observations one-hot coded unless
                 demonstrations is a state-occupancy measure.
             env: a tabular MDP.
+            rng: random state used for sampling from policy.
             reward_net: a neural network that computes rewards for the supplied
                 observations.
-            optimizer_cls: optimiser to use for supervised training.
-            optimizer_kwargs: keyword arguments for optimiser construction.
+            optimizer_cls: optimizer to use for supervised training.
+            optimizer_kwargs: keyword arguments for optimizer construction.
             discount: the discount factor to use when computing occupancy measure.
                 If not 1.0 (undiscounted), then `demonstrations` must either be
                 a (discounted) state-occupancy measure, or trajectories. Transitions
@@ -290,8 +306,10 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
                 MCE IRL gradient falls below this value.
             log_interval: how often to log current loss stats (using `logging`).
                 None to disable.
-            rng: random state used for sampling from policy.
             custom_logger: Where to log to; if None (default), creates a new logger.
+
+        Raises:
+            ValueError: if the env horizon is not finite (or an integer).
         """
         self.discount = discount
         self.env = env
@@ -313,17 +331,19 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
         # Initialize policy to be uniform random. We don't use this for MCE IRL
         # training, but it gives us something to return at all times with `policy`
         # property, similar to other algorithms.
-        ones = np.ones((self.env.horizon, self.env.n_states, self.env.n_actions))
-        uniform_pi = ones / self.env.n_actions
+        if self.env.horizon is None:
+            raise ValueError("Only finite-horizon environments are supported.")
+        ones = np.ones((self.env.horizon, self.env.state_dim, self.env.action_dim))
+        uniform_pi = ones / self.env.action_dim
         self._policy = TabularPolicy(
-            state_space=self.env.pomdp_state_space,
+            state_space=self.env.state_space,
             action_space=self.env.action_space,
             pi=uniform_pi,
             rng=self.rng,
         )
 
     def _set_demo_from_trajectories(self, trajs: Iterable[types.Trajectory]) -> None:
-        self.demo_state_om = np.zeros((self.env.n_states,))
+        self.demo_state_om = np.zeros((self.env.state_dim,))
         num_demos = 0
         for traj in trajs:
             cum_discount = 1.0
@@ -339,7 +359,7 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
         dones: Optional[np.ndarray],
         next_obses: Optional[np.ndarray],
     ) -> None:
-        self.demo_state_om = np.zeros((self.env.n_states,))
+        self.demo_state_om = np.zeros((self.env.state_dim,))
 
         for obs in obses:
             if isinstance(obs, th.Tensor):
@@ -350,7 +370,7 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
         # then possibly shuffled. So add next observations for terminal states,
         # as they will not appear anywhere else; but ignore next observations
         # for all other states as they occur elsewhere in dataset.
-        if next_obses is not None:
+        if dones is not None and next_obses is not None:
             for done, obs in zip(dones, next_obses):
                 if isinstance(done, th.Tensor):
                     done = done.item()  # must be scalar
@@ -364,6 +384,7 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
             )
 
         # Normalize occupancy measure estimates
+        assert self.env.horizon is not None
         self.demo_state_om *= (self.env.horizon + 1) / self.demo_state_om.sum()
 
     def set_demonstrations(self, demonstrations: MCEDemonstrations) -> None:
@@ -376,9 +397,9 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
         # Demonstrations are either trajectories or transitions;
         # we must compute occupancy measure from this.
         if isinstance(demonstrations, Iterable):
-            first_item = next(iter(demonstrations))
+            first_item, demonstrations_it = util.get_first_iter_element(demonstrations)
             if isinstance(first_item, types.Trajectory):
-                self._set_demo_from_trajectories(demonstrations)
+                self._set_demo_from_trajectories(demonstrations_it)
                 return
 
         # Demonstrations are from some kind of transitions-like object. This does
@@ -401,14 +422,13 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
             # Collect them together into one big NumPy array. This is inefficient,
             # we could compute the running statistics instead, but in practice do
             # not expect large dataset sizes together with MCE IRL.
-            collated = collections.defaultdict(list)
+            collated_list = collections.defaultdict(list)
             for batch in demonstrations:
                 assert isinstance(batch, Mapping)
                 for k in ("obs", "dones", "next_obs"):
                     if k in batch:
-                        collated[k].append(batch[k])
-            for k, v in collated.items():
-                collated[k] = np.concatenate(v)
+                        collated_list[k].append(batch[k])
+            collated = {k: np.concatenate(v) for k, v in collated_list.items()}
 
             assert "obs" in collated
             for k, v in collated.items():
@@ -423,7 +443,7 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
                 f"Unsupported demonstration type {type(demonstrations)}",
             )
 
-    def _train_step(self, obs_mat: th.Tensor):
+    def _train_step(self, obs_mat: th.Tensor) -> Tuple[np.ndarray, np.ndarray]:
         self.optimizer.zero_grad()
 
         # get reward predicted for each state by current model, & compute
@@ -474,6 +494,7 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
             dtype=self.reward_net.dtype,
             device=self.reward_net.device,
         )
+        assert self.demo_state_om is not None
         assert self.demo_state_om.shape == (len(obs_mat),)
 
         with networks.training(self.reward_net):
@@ -482,9 +503,11 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
                 predicted_r_np, visitations = self._train_step(torch_obs_mat)
 
                 # these are just for termination conditions & debug logging
-                grad_norm = util.tensor_iter_norm(
-                    p.grad for p in self.reward_net.parameters()
-                ).item()
+                grads = []
+                for p in self.reward_net.parameters():
+                    assert p.grad is not None  # for type checker
+                    grads.append(p.grad)
+                grad_norm = util.tensor_iter_norm(grads).item()
                 linf_delta = np.max(np.abs(self.demo_state_om - visitations))
 
                 if self.log_interval is not None and 0 == (t % self.log_interval):

@@ -1,7 +1,17 @@
 """Module of base classes and helper methods for imitation learning algorithms."""
 
 import abc
-from typing import Any, Generic, Iterable, Mapping, Optional, TypeVar, Union
+from typing import (
+    Any,
+    Generic,
+    Iterable,
+    Iterator,
+    Mapping,
+    Optional,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import numpy as np
 import torch as th
@@ -10,6 +20,7 @@ from stable_baselines3.common import policies
 
 from imitation.data import rollout, types
 from imitation.util import logger as imit_logger
+from imitation.util import util
 
 
 class BaseImitationAlgorithm(abc.ABC):
@@ -39,7 +50,7 @@ class BaseImitationAlgorithm(abc.ABC):
                 training. If True, overrides this safety check. WARNING: variable
                 horizon episodes leak information about the reward via termination
                 condition, and can seriously confound evaluation. Read
-                https://imitation.readthedocs.io/en/latest/guide/variable_horizon.html
+                https://imitation.readthedocs.io/en/latest/getting-started/variable-horizon.html
                 before overriding this.
         """
         self._logger = custom_logger or imit_logger.configure()
@@ -52,13 +63,13 @@ class BaseImitationAlgorithm(abc.ABC):
                 "Additionally, even unbiased algorithms can exploit "
                 "the information leak from the termination condition, "
                 "producing spuriously high performance. See "
-                "https://imitation.readthedocs.io/en/latest/guide/variable_horizon.html"
-                " for more information.",
+                "https://imitation.readthedocs.io/en/latest/getting-started/"
+                "variable-horizon.html for more information.",
             )
         self._horizon = None
 
     @property
-    def logger(self):
+    def logger(self) -> imit_logger.HierarchicalLogger:
         return self._logger
 
     @logger.setter
@@ -116,7 +127,7 @@ TransitionKind = TypeVar("TransitionKind", bound=types.TransitionsMinimal)
 AnyTransitions = Union[
     Iterable[types.Trajectory],
     Iterable[TransitionMapping],
-    TransitionKind,
+    types.TransitionsMinimal,
 ]
 
 
@@ -181,7 +192,7 @@ class _WrappedDataLoader:
         data_loader: Iterable[TransitionMapping],
         expected_batch_size: int,
     ):
-        """Builds _WrapedDataLoader.
+        """Builds _WrappedDataLoader.
 
         Args:
             data_loader: The data loader (batch iterable) to wrap.
@@ -190,8 +201,8 @@ class _WrappedDataLoader:
         self.data_loader = data_loader
         self.expected_batch_size = expected_batch_size
 
-    def __iter__(self):
-        """Iterator yielding data from `self.data_loader`, checking `self.expected_batch_size`.
+    def __iter__(self) -> Iterator[TransitionMapping]:
+        """Yields data from `self.data_loader`, checking `self.expected_batch_size`.
 
         Yields:
             Identity -- yields same batches as from `self.data_loader`.
@@ -242,11 +253,15 @@ def make_data_loader(
         raise ValueError(f"batch_size={batch_size} must be positive.")
 
     if isinstance(transitions, Iterable):
-        try:
-            first_item = next(iter(transitions))
-        except StopIteration:
-            first_item = None
+        # Inferring the correct type here is difficult with generics.
+        (
+            first_item,
+            transitions,
+        ) = util.get_first_iter_element(  # type: ignore[assignment]
+            transitions,
+        )
         if isinstance(first_item, types.Trajectory):
+            transitions = cast(Iterable[types.Trajectory], transitions)
             transitions = rollout.flatten_trajectories(list(transitions))
 
     if isinstance(transitions, types.TransitionsMinimal):
@@ -256,16 +271,20 @@ def make_data_loader(
                 f"is smaller than batch size {batch_size}.",
             )
 
-        extra_kwargs = dict(shuffle=True, drop_last=True)
-        if data_loader_kwargs is not None:
-            extra_kwargs.update(data_loader_kwargs)
+        kwargs: Mapping[str, Any] = {
+            "shuffle": True,
+            "drop_last": True,
+            **(data_loader_kwargs or {}),
+        }
         return th_data.DataLoader(
             transitions,
             batch_size=batch_size,
             collate_fn=types.transitions_collate_fn,
-            **extra_kwargs,
+            **kwargs,
         )
     elif isinstance(transitions, Iterable):
-        return _WrappedDataLoader(transitions, batch_size)
+        # Safe to ignore this error since we've already converted Iterable[Trajectory]
+        # `transitions` into Iterable[TransitionMapping]
+        return _WrappedDataLoader(transitions, batch_size)  # type: ignore[arg-type]
     else:
         raise TypeError(f"`demonstrations` unexpected type {type(transitions)}")
