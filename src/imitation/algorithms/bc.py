@@ -28,6 +28,7 @@ from imitation.algorithms import base as algo_base
 from imitation.data import rollout, types
 from imitation.policies import base as policy_base
 from imitation.util import logger as imit_logger
+from imitation.util import util
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,7 +43,7 @@ class BatchIteratorWithEpochEndCallback:
     n_batches: Optional[int]
     on_epoch_end: Optional[Callable[[int], None]]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         epochs_and_batches_specified = (
             self.n_epochs is not None and self.n_batches is not None
         )
@@ -55,18 +56,18 @@ class BatchIteratorWithEpochEndCallback:
             )
 
     def __iter__(self) -> Iterator[algo_base.TransitionMapping]:
-        def batch_iterator():
+        def batch_iterator() -> Iterator[algo_base.TransitionMapping]:
 
             # Note: the islice here ensures we do not exceed self.n_epochs
             for epoch_num in itertools.islice(itertools.count(), self.n_epochs):
-                num_batches_in_epoch = 0
-                for num_batches_in_epoch, batch in enumerate(self.batch_loader):
+                some_batch_was_yielded = False
+                for batch in self.batch_loader:
                     yield batch
+                    some_batch_was_yielded = True
 
-                if num_batches_in_epoch == 0:
+                if not some_batch_was_yielded:
                     raise AssertionError(
-                        f"Data loader returned no data after "
-                        f"{num_batches_in_epoch} batches, during epoch "
+                        f"Data loader returned no data during epoch "
                         f"{epoch_num} -- did it reset correctly?",
                     )
                 if self.on_epoch_end is not None:
@@ -113,6 +114,8 @@ class BehaviorCloningLossCalculator:
             A BCTrainingMetrics object with the loss and all the components it
             consists of.
         """
+        obs = util.safe_to_tensor(obs)
+        acts = util.safe_to_tensor(acts)
         _, log_prob, entropy = policy.evaluate_actions(obs, acts)
         prob_true_act = th.exp(log_prob).mean()
         log_prob = log_prob.mean()
@@ -120,6 +123,8 @@ class BehaviorCloningLossCalculator:
 
         l2_norms = [th.sum(th.square(w)) for w in policy.parameters()]
         l2_norm = sum(l2_norms) / 2  # divide by 2 to cancel with gradient of square
+        # sum of list defaults to float(0) if len == 0.
+        assert isinstance(l2_norm, th.Tensor)
 
         ent_loss = -self.ent_weight * entropy
         neglogp = -log_prob
@@ -135,26 +140,6 @@ class BehaviorCloningLossCalculator:
             l2_loss=l2_loss,
             loss=loss,
         )
-
-
-@dataclasses.dataclass(frozen=True)
-class BehaviorCloningTrainer:
-    """Functor to fit a policy to expert demonstration data."""
-
-    loss: BehaviorCloningLossCalculator
-    optimizer: th.optim.Optimizer
-    policy: policies.ActorCriticPolicy
-
-    def __call__(self, batch) -> BCTrainingMetrics:
-        obs = th.as_tensor(batch["obs"], device=self.policy.device).detach()
-        acts = th.as_tensor(batch["acts"], device=self.policy.device).detach()
-        training_metrics = self.loss(self.policy, obs, acts)
-
-        self.optimizer.zero_grad()
-        training_metrics.loss.backward()
-        self.optimizer.step()
-
-        return training_metrics
 
 
 def enumerate_batches(
@@ -177,7 +162,7 @@ class RolloutStatsComputer:
         n_episodes: The number of episodes to base the statistics on.
     """
 
-    venv: vec_env.VecEnv
+    venv: Optional[vec_env.VecEnv]
     n_episodes: int
 
     # TODO(shwang): Maybe instead use a callback that can be shared between
@@ -185,12 +170,17 @@ class RolloutStatsComputer:
     #   EvalCallback could be a good fit:
     #   https://stable-baselines3.readthedocs.io/en/master/guide/callbacks.html#evalcallback
 
-    def __call__(self, policy: policies.ActorCriticPolicy) -> Mapping[str, float]:
+    def __call__(
+        self,
+        policy: policies.ActorCriticPolicy,
+        rng: np.random.Generator,
+    ) -> Mapping[str, float]:
         if self.venv is not None and self.n_episodes > 0:
             trajs = rollout.generate_trajectories(
                 policy,
                 self.venv,
                 rollout.make_min_episodes(self.n_episodes),
+                rng=rng,
             )
             return rollout.rollout_stats(trajs)
         else:
@@ -272,9 +262,11 @@ class BC(algo_base.DemonstrationAlgorithm):
         *,
         observation_space: gym.Space,
         action_space: gym.Space,
+        rng: np.random.Generator,
         policy: Optional[policies.ActorCriticPolicy] = None,
         demonstrations: Optional[algo_base.AnyTransitions] = None,
         batch_size: int = 32,
+        minibatch_size: Optional[int] = None,
         optimizer_cls: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Mapping[str, Any]] = None,
         ent_weight: float = 1e-3,
@@ -287,6 +279,7 @@ class BC(algo_base.DemonstrationAlgorithm):
         Args:
             observation_space: the observation space of the environment.
             action_space: the action space of the environment.
+            rng: the random state to use for the random number generator.
             policy: a Stable Baselines3 policy; if unspecified,
                 defaults to `FeedForward32Policy`.
             demonstrations: Demonstrations from an expert (optional). Transitions
@@ -294,6 +287,14 @@ class BC(algo_base.DemonstrationAlgorithm):
                 of trajectories, or an iterable of transition batches (mappings from
                 keywords to arrays containing observations, etc).
             batch_size: The number of samples in each batch of expert data.
+            minibatch_size: size of minibatch to calculate gradients over.
+                The gradients are accumulated until `batch_size` examples
+                are processed before making an optimization step. This
+                is useful in GPU training to reduce memory usage, since
+                fewer examples are loaded into memory at once,
+                facilitating training with larger batch sizes, but is
+                generally slower. Must be a factor of `batch_size`.
+                Optional, defaults to `batch_size`.
             optimizer_cls: optimiser to use for supervised training.
             optimizer_kwargs: keyword arguments, excluding learning rate and
                 weight decay, for optimiser construction.
@@ -304,10 +305,14 @@ class BC(algo_base.DemonstrationAlgorithm):
 
         Raises:
             ValueError: If `weight_decay` is specified in `optimizer_kwargs` (use the
-                parameter `l2_weight` instead.)
+                parameter `l2_weight` instead), or if the batch size is not a multiple
+                of the minibatch size.
         """
         self._demo_data_loader: Optional[Iterable[algo_base.TransitionMapping]] = None
         self.batch_size = batch_size
+        self.minibatch_size = minibatch_size or batch_size
+        if self.batch_size % self.minibatch_size != 0:
+            raise ValueError("Batch size must be a multiple of minibatch size.")
         super().__init__(
             demonstrations=demonstrations,
             custom_logger=custom_logger,
@@ -316,6 +321,8 @@ class BC(algo_base.DemonstrationAlgorithm):
 
         self.action_space = action_space
         self.observation_space = observation_space
+
+        self.rng = rng
 
         if policy is None:
             policy = policy_base.FeedForward32Policy(
@@ -334,16 +341,12 @@ class BC(algo_base.DemonstrationAlgorithm):
             if "weight_decay" in optimizer_kwargs:
                 raise ValueError("Use the parameter l2_weight instead of weight_decay.")
         optimizer_kwargs = optimizer_kwargs or {}
-        optimizer = optimizer_cls(
+        self.optimizer = optimizer_cls(
             self.policy.parameters(),
             **optimizer_kwargs,
         )
-        loss_computer = BehaviorCloningLossCalculator(ent_weight, l2_weight)
-        self.trainer = BehaviorCloningTrainer(
-            loss_computer,
-            optimizer,
-            policy,
-        )
+
+        self.loss_calculator = BehaviorCloningLossCalculator(ent_weight, l2_weight)
 
     @property
     def policy(self) -> policies.ActorCriticPolicy:
@@ -352,7 +355,7 @@ class BC(algo_base.DemonstrationAlgorithm):
     def set_demonstrations(self, demonstrations: algo_base.AnyTransitions) -> None:
         self._demo_data_loader = algo_base.make_data_loader(
             demonstrations,
-            self.batch_size,
+            self.minibatch_size,
         )
 
     def train(
@@ -417,10 +420,14 @@ class BC(algo_base.DemonstrationAlgorithm):
             if on_epoch_end is not None:
                 on_epoch_end()
 
+        mini_per_batch = self.batch_size // self.minibatch_size
+        n_minibatches = n_batches * mini_per_batch if n_batches is not None else None
+
+        assert self._demo_data_loader is not None
         demonstration_batches = BatchIteratorWithEpochEndCallback(
             self._demo_data_loader,
             n_epochs,
-            n_batches,
+            n_minibatches,
             _on_epoch_end,
         )
         batches_with_stats = enumerate_batches(demonstration_batches)
@@ -430,26 +437,52 @@ class BC(algo_base.DemonstrationAlgorithm):
             batches_with_stats = tqdm.tqdm(
                 batches_with_stats,
                 unit="batch",
-                total=n_batches,
+                total=n_minibatches,
             )
             tqdm_progress_bar = batches_with_stats
 
-        for (batch_num, batch_size, num_samples_so_far), batch in batches_with_stats:
-            loss = self.trainer(batch)
+        def process_batch():
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
             if batch_num % log_interval == 0:
-                rollout_stats = compute_rollout_stats(self.policy)
+                rollout_stats = compute_rollout_stats(self.policy, self.rng)
 
                 self._bc_logger.log_batch(
                     batch_num,
-                    batch_size,
+                    minibatch_size,
                     num_samples_so_far,
-                    loss,
+                    training_metrics,
                     rollout_stats,
                 )
 
             if on_batch_end is not None:
                 on_batch_end()
+
+        self.optimizer.zero_grad()
+        for (
+            batch_num,
+            minibatch_size,
+            num_samples_so_far,
+        ), batch in batches_with_stats:
+            obs = th.as_tensor(batch["obs"], device=self.policy.device).detach()
+            acts = th.as_tensor(batch["acts"], device=self.policy.device).detach()
+            training_metrics = self.loss_calculator(self.policy, obs, acts)
+
+            # Renormalise the loss to be averaged over the whole
+            # batch size instead of the minibatch size.
+            # If there is an incomplete batch, its gradients will be
+            # smaller, which may be helpful for stability.
+            loss = training_metrics.loss * minibatch_size / self.batch_size
+            loss.backward()
+
+            batch_num = batch_num * self.minibatch_size // self.batch_size
+            if num_samples_so_far % self.batch_size == 0:
+                process_batch()
+        if num_samples_so_far % self.batch_size != 0:
+            # if there remains an incomplete batch
+            batch_num += 1
+            process_batch()
 
     def save_policy(self, policy_path: types.AnyPath) -> None:
         """Save policy to a path. Can be reloaded by `.reconstruct_policy()`.
@@ -457,4 +490,4 @@ class BC(algo_base.DemonstrationAlgorithm):
         Args:
             policy_path: path to save policy to.
         """
-        th.save(self.policy, policy_path)
+        th.save(self.policy, types.parse_path(policy_path))

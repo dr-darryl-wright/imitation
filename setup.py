@@ -14,16 +14,14 @@ if TYPE_CHECKING:
 IS_NOT_WINDOWS = os.name != "nt"
 
 PARALLEL_REQUIRE = ["ray[debug,tune]~=2.0.0"]
+ATARI_REQUIRE = [
+    "opencv-python",
+    "ale-py==0.7.4",
+    "pillow",
+    "autorom[accept-rom-license]~=0.4.2",
+]
 PYTYPE = ["pytype==2022.7.26"] if IS_NOT_WINDOWS else []
-if IS_NOT_WINDOWS:
-    # TODO(adam): use this for Windows as well once PyPI is at >=1.6.1
-    STABLE_BASELINES3 = "stable-baselines3>=1.4.0"
-else:
-    STABLE_BASELINES3 = (
-        "stable-baselines3@git+"
-        "https://github.com/DLR-RM/stable-baselines3.git@master"
-    )
-
+STABLE_BASELINES3 = "stable-baselines3>=1.6.1"
 # pinned to 0.21 until https://github.com/DLR-RM/stable-baselines3/pull/780 goes
 # upstream.
 GYM_VERSION_SPECIFIER = "==0.19"
@@ -32,7 +30,6 @@ GYM_VERSION_SPECIFIER = "==0.19"
 #   working versions to make our CI/CD pipeline as stable as possible.
 TESTS_REQUIRE = (
     [
-        "seals==0.1.2",
         "black[jupyter]~=22.6.0",
         "coverage~=6.4.2",
         "codecov~=2.1.12",
@@ -52,6 +49,7 @@ TESTS_REQUIRE = (
         # TODO: upgrade jupyter-client once
         #  https://github.com/jupyter/jupyter_client/issues/637 is fixed
         "jupyter-client~=6.1.12",
+        "mypy~=0.981",
         "pandas~=1.4.3",
         "pytest~=7.1.2",
         "pytest-cov~=3.0.0",
@@ -60,8 +58,10 @@ TESTS_REQUIRE = (
         "scipy~=1.9.0",
         "wandb==0.12.21",
         "setuptools_scm~=7.0.5",
+        "pre-commit>=2.20.0",
     ]
     + PARALLEL_REQUIRE
+    + ATARI_REQUIRE
     + PYTYPE
 )
 DOCS_REQUIRE = [
@@ -72,7 +72,9 @@ DOCS_REQUIRE = [
     "furo==2022.6.21",
     "sphinx-copybutton==0.5.0",
     "sphinx-github-changelog~=1.2.0",
-]
+    "myst-nb==0.16.0",
+    "ipykernel~=6.15.2",
+] + ATARI_REQUIRE
 
 
 def get_readme() -> str:
@@ -192,24 +194,28 @@ setup(
     #   for our users.
     install_requires=[
         "gym[classic_control]" + GYM_VERSION_SPECIFIER,
+        # TODO(adam): remove pyglet dependency once Gym upgraded to >0.21
+        # Workaround for https://github.com/openai/gym/issues/2986
+        # Discussed in https://github.com/HumanCompatibleAI/imitation/pull/603
+        "pyglet==1.5.27",
         "matplotlib",
         "numpy>=1.15",
         "torch>=1.4.0",
         "tqdm",
         "scikit-learn>=0.21.2",
+        "seals>=0.1.5",
         STABLE_BASELINES3,
         # TODO(adam) switch to upstream release if they make it
         #  See https://github.com/IDSIA/sacred/issues/879
         "chai-sacred>=0.8.3",
         "tensorboard>=1.14",
+        "huggingface_sb3>=2.2.1",
     ],
     tests_require=TESTS_REQUIRE,
     extras_require={
         # recommended packages for development
         "dev": [
             "autopep8",
-            "awscli",
-            "ntfy[slack]",
             "ipdb",
             "isort~=5.0",
             "codespell",
@@ -225,6 +231,7 @@ setup(
         "mujoco": [
             "gym[classic_control,mujoco]" + GYM_VERSION_SPECIFIER,
         ],
+        "atari": ATARI_REQUIRE,
     },
     entry_points={
         "console_scripts": [

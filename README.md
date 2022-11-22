@@ -23,6 +23,13 @@ You can find [the documentation here](https://imitation.readthedocs.io/en/latest
 
 ## Installation
 
+### Prerequisites
+
+- Python 3.8+
+- (Optional) OpenGL (to render Gym environments)
+- (Optional) FFmpeg (to encode videos of renders)
+- (Optional) MuJoCo (follow instructions to install [mujoco_py v1.5 here](https://github.com/openai/mujoco-py/tree/498b451a03fb61e5bdfcb6956d8d7c881b1098b5#install-mujoco))
+
 ### Installing PyPI release
 
 Installing the PyPI release is the standard way to use `imitation`, and the recommended way for most users.
@@ -48,17 +55,13 @@ This will run `setup.py` in development mode, and install the additional depende
 pip install .
 ```
 
-Additional extras are available depending on your needs. Namely, `tests` for running the test suite, `docs` for building the documentation, and `parallel` for parallelizing the training. The `dev` extra already installs the `tests` and `docs` dependencies automatically.
+Additional extras are available depending on your needs. Namely, `tests` for running the test suite, `docs` for building the documentation, `parallel` for parallelizing the training, and `atari` for including atari environments. The `dev` extra already installs the `tests`, `docs`, and `atari` dependencies automatically, and `tests` installs the `atari` dependencies.
 
 For macOS users, some packages are required to run experiments (see `./experiments/README.md` for details). First, install Homebrew if not available (see [Homebrew](https://brew.sh/)). Then, run:
 
 ```
 brew install coreutils gnu-getopt parallel
 ```
-
-### Optional Mujoco Dependency
-
-Follow instructions to install [mujoco_py v1.5 here](https://github.com/openai/mujoco-py/tree/498b451a03fb61e5bdfcb6956d8d7c881b1098b5#install-mujoco).
 
 ## CLI Quickstart
 
@@ -71,10 +74,10 @@ From [examples/quickstart.sh:](examples/quickstart.sh)
 python -m imitation.scripts.train_rl with pendulum common.fast train.fast rl.fast fast common.log_dir=quickstart/rl/
 
 # Train GAIL from demonstrations. Tensorboard logs saved in output/ (default log directory).
-python -m imitation.scripts.train_adversarial gail with pendulum common.fast demonstrations.fast train.fast rl.fast fast demonstrations.rollout_path=quickstart/rl/rollouts/final.pkl
+python -m imitation.scripts.train_adversarial gail with pendulum common.fast demonstrations.fast train.fast rl.fast fast demonstrations.rollout_path=quickstart/rl/rollouts/final.npz
 
 # Train AIRL from demonstrations. Tensorboard logs saved in output/ (default log directory).
-python -m imitation.scripts.train_adversarial airl with pendulum common.fast demonstrations.fast train.fast rl.fast fast demonstrations.rollout_path=quickstart/rl/rollouts/final.pkl
+python -m imitation.scripts.train_adversarial airl with pendulum common.fast demonstrations.fast train.fast rl.fast fast demonstrations.rollout_path=quickstart/rl/rollouts/final.npz
 ```
 
 Tips:
@@ -90,7 +93,7 @@ See [examples/quickstart.py](examples/quickstart.py) for an example script that 
 
 ### Density reward baseline
 
-We also implement a density-based reward baseline. You can find an [example notebook here](examples/7_train_density.ipynb).
+We also implement a density-based reward baseline. You can find an [example notebook here](docs/tutorials/7_train_density.ipynb).
 
 # Citations (BibTeX)
 

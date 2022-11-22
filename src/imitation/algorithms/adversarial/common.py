@@ -1,16 +1,14 @@
 """Core code for adversarial imitation learning, shared between GAIL and AIRL."""
 import abc
-import collections
 import dataclasses
 import logging
-import os
-from typing import Callable, Mapping, Optional, Sequence, Tuple, Type
+from typing import Callable, Iterable, Iterator, Mapping, Optional, Type, overload
 
 import numpy as np
 import torch as th
 import torch.utils.tensorboard as thboard
 import tqdm
-from stable_baselines3.common import base_class, policies, vec_env
+from stable_baselines3.common import base_class, on_policy_algorithm, policies, vec_env
 from stable_baselines3.sac import policies as sac_policies
 from torch.nn import functional as F
 
@@ -63,7 +61,7 @@ def compute_train_stats(
         else:
             # float() is defensive, since we cannot divide Torch tensors by
             # Python ints
-            expert_acc = _n_pred_expert / float(n_expert)
+            expert_acc = _n_pred_expert.item() / float(n_expert)
 
         _n_pred_gen = th.sum(th.logical_and(bin_is_generated_true, correct_vec))
         _n_gen_or_1 = max(1, n_generated)
@@ -72,23 +70,20 @@ def compute_train_stats(
         label_dist = th.distributions.Bernoulli(logits=disc_logits_expert_is_high)
         entropy = th.mean(label_dist.entropy())
 
-    pairs = [
-        ("disc_loss", float(th.mean(disc_loss))),
-        # accuracy, as well as accuracy on *just* expert examples and *just*
-        # generated examples
-        ("disc_acc", float(acc)),
-        ("disc_acc_expert", float(expert_acc)),
-        ("disc_acc_gen", float(generated_acc)),
+    return {
+        "disc_loss": float(th.mean(disc_loss)),
+        "disc_acc": float(acc),
+        "disc_acc_expert": float(expert_acc),  # accuracy on just expert examples
+        "disc_acc_gen": float(generated_acc),  # accuracy on just generated examples
         # entropy of the predicted label distribution, averaged equally across
         # both classes (if this drops then disc is very good or has given up)
-        ("disc_entropy", float(entropy)),
+        "disc_entropy": float(entropy),
         # true number of expert demos and predicted number of expert demos
-        ("disc_proportion_expert_true", float(pct_expert)),
-        ("disc_proportion_expert_pred", float(pct_expert_pred)),
-        ("n_expert", float(n_expert)),
-        ("n_generated", float(n_generated)),
-    ]  # type: Sequence[Tuple[str, float]]
-    return collections.OrderedDict(pairs)
+        "disc_proportion_expert_true": float(pct_expert),
+        "disc_proportion_expert_pred": float(pct_expert_pred),
+        "n_expert": float(n_expert),
+        "n_generated": float(n_generated),
+    }
 
 
 class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
@@ -103,6 +98,11 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
     If `debug_use_ground_truth=True` was passed into the initializer then
     `self.venv_train` is the same as `self.venv`."""
 
+    _demo_data_loader: Optional[Iterable[base.TransitionMapping]]
+    _endless_expert_iterator: Optional[Iterator[base.TransitionMapping]]
+
+    venv_wrapped: vec_env.VecEnvWrapper
+
     def __init__(
         self,
         *,
@@ -111,8 +111,9 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         venv: vec_env.VecEnv,
         gen_algo: base_class.BaseAlgorithm,
         reward_net: reward_nets.RewardNet,
+        demo_minibatch_size: Optional[int] = None,
         n_disc_updates_per_round: int = 2,
-        log_dir: str = "output/",
+        log_dir: types.AnyPath = "output/",
         disc_opt_cls: Type[th.optim.Optimizer] = th.optim.Adam,
         disc_opt_kwargs: Optional[Mapping] = None,
         gen_train_timesteps: Optional[int] = None,
@@ -139,6 +140,14 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
                 `venv` and `custom_logger`.
             reward_net: a Torch module that takes an observation, action and
                 next observation tensors as input and computes a reward signal.
+            demo_minibatch_size: size of minibatch to calculate gradients over.
+                The gradients are accumulated until the entire batch is
+                processed before making an optimization step. This is
+                useful in GPU training to reduce memory usage, since
+                fewer examples are loaded into memory at once,
+                facilitating training with larger batch sizes, but is
+                generally slower. Must be a factor of `demo_batch_size`.
+                Optional, defaults to `demo_batch_size`.
             n_disc_updates_per_round: The number of discriminator updates after each
                 round of generator updates in AdversarialTrainer.learn().
             log_dir: Directory to store TensorBoard logs, plots, etc. in.
@@ -169,8 +178,14 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
                 condition, and can seriously confound evaluation. Read
                 https://imitation.readthedocs.io/en/latest/guide/variable_horizon.html
                 before overriding this.
+
+        Raises:
+            ValueError: if the batch size is not a multiple of the minibatch size.
         """
         self.demo_batch_size = demo_batch_size
+        self.demo_minibatch_size = demo_minibatch_size or demo_batch_size
+        if self.demo_batch_size % self.demo_minibatch_size != 0:
+            raise ValueError("Batch size must be a multiple of minibatch size.")
         self._demo_data_loader = None
         self._endless_expert_iterator = None
         super().__init__(
@@ -187,7 +202,7 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         self.venv = venv
         self.gen_algo = gen_algo
         self._reward_net = reward_net.to(gen_algo.device)
-        self._log_dir = log_dir
+        self._log_dir = types.parse_path(log_dir)
 
         # Create graph for optimising/recording stats on discriminator
         self._disc_opt_cls = disc_opt_cls
@@ -200,20 +215,20 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         )
 
         if self._init_tensorboard:
-            logging.info("building summary directory at " + self._log_dir)
-            summary_dir = os.path.join(self._log_dir, "summary")
-            os.makedirs(summary_dir, exist_ok=True)
-            self._summary_writer = thboard.SummaryWriter(summary_dir)
+            logging.info(f"building summary directory at {self._log_dir}")
+            summary_dir = self._log_dir / "summary"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            self._summary_writer = thboard.SummaryWriter(str(summary_dir))
 
-        venv = self.venv_buffering = wrappers.BufferingWrapper(self.venv)
+        self.venv_buffering = wrappers.BufferingWrapper(self.venv)
 
         if debug_use_ground_truth:
             # Would use an identity reward fn here, but RewardFns can't see rewards.
-            self.venv_wrapped = venv
+            self.venv_wrapped = self.venv_buffering
             self.gen_callback = None
         else:
-            venv = self.venv_wrapped = reward_wrapper.RewardVecEnvWrapper(
-                venv,
+            self.venv_wrapped = reward_wrapper.RewardVecEnvWrapper(
+                self.venv_buffering,
                 reward_fn=self.reward_train.predict_processed,
             )
             self.gen_callback = self.venv_wrapped.make_log_callback()
@@ -226,7 +241,7 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             gen_algo_env = self.gen_algo.get_env()
             assert gen_algo_env is not None
             self.gen_train_timesteps = gen_algo_env.num_envs
-            if hasattr(self.gen_algo, "n_steps"):  # on policy
+            if isinstance(self.gen_algo, on_policy_algorithm.OnPolicyAlgorithm):
                 self.gen_train_timesteps *= self.gen_algo.n_steps
         else:
             self.gen_train_timesteps = gen_train_timesteps
@@ -240,7 +255,9 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
 
     @property
     def policy(self) -> policies.BasePolicy:
-        return self.gen_algo.policy
+        policy = self.gen_algo.policy
+        assert policy is not None
+        return policy
 
     @abc.abstractmethod
     def logits_expert_is_high(
@@ -288,6 +305,7 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         self._endless_expert_iterator = util.endless_iter(self._demo_data_loader)
 
     def _next_expert_batch(self) -> Mapping:
+        assert self._endless_expert_iterator is not None
         return next(self._endless_expert_iterator)
 
     def train_disc(
@@ -295,7 +313,7 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         *,
         expert_samples: Optional[Mapping] = None,
         gen_samples: Optional[Mapping] = None,
-    ) -> Optional[Mapping[str, float]]:
+    ) -> Mapping[str, float]:
         """Perform a single discriminator update, optionally using provided samples.
 
         Args:
@@ -319,25 +337,32 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             write_summaries = self._init_tensorboard and self._global_step % 20 == 0
 
             # compute loss
-            batch = self._make_disc_train_batch(
+            self._disc_opt.zero_grad()
+
+            batch_iter = self._make_disc_train_batches(
                 gen_samples=gen_samples,
                 expert_samples=expert_samples,
             )
-            disc_logits = self.logits_expert_is_high(
-                batch["state"],
-                batch["action"],
-                batch["next_state"],
-                batch["done"],
-                batch["log_policy_act_prob"],
-            )
-            loss = F.binary_cross_entropy_with_logits(
-                disc_logits,
-                batch["labels_expert_is_one"].float(),
-            )
+            for batch in batch_iter:
+                disc_logits = self.logits_expert_is_high(
+                    batch["state"],
+                    batch["action"],
+                    batch["next_state"],
+                    batch["done"],
+                    batch["log_policy_act_prob"],
+                )
+                loss = F.binary_cross_entropy_with_logits(
+                    disc_logits,
+                    batch["labels_expert_is_one"].float(),
+                )
+
+                # Renormalise the loss to be averaged over the whole
+                # batch size instead of the minibatch size.
+                assert len(batch["state"]) == 2 * self.demo_minibatch_size
+                loss *= self.demo_minibatch_size / self.demo_batch_size
+                loss.backward()
 
             # do gradient step
-            self._disc_opt.zero_grad()
-            loss.backward()
             self._disc_opt.step()
             self._disc_step += 1
 
@@ -429,9 +454,18 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
                 callback(r)
             self.logger.dump(self._global_step)
 
+    @overload
+    def _torchify_array(self, ndarray: np.ndarray) -> th.Tensor:
+        ...
+
+    @overload
+    def _torchify_array(self, ndarray: None) -> None:
+        ...
+
     def _torchify_array(self, ndarray: Optional[np.ndarray]) -> Optional[th.Tensor]:
         if ndarray is not None:
             return th.as_tensor(ndarray, device=self.reward_train.device)
+        return None
 
     def _get_log_policy_act_prob(
         self,
@@ -473,20 +507,20 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             return None
         return log_policy_act_prob_th
 
-    def _make_disc_train_batch(
+    def _make_disc_train_batches(
         self,
         *,
         gen_samples: Optional[Mapping] = None,
         expert_samples: Optional[Mapping] = None,
-    ) -> Mapping[str, th.Tensor]:
-        """Build and return training batch for the next discriminator update.
+    ) -> Iterator[Mapping[str, th.Tensor]]:
+        """Build and return training minibatches for the next discriminator update.
 
         Args:
             gen_samples: Same as in `train_disc`.
             expert_samples: Same as in `train_disc`.
 
-        Returns:
-            The training batch: state, action, next state, dones, labels
+        Yields:
+            The training minibatch: state, action, next state, dones, labels
             and policy log-probabilities.
 
         Raises:
@@ -494,6 +528,8 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             ValueError: `gen_samples` or `expert_samples` batch size is
                 different from `self.demo_batch_size`.
         """
+        batch_size = self.demo_batch_size
+
         if expert_samples is None:
             expert_samples = self._next_expert_batch()
 
@@ -502,17 +538,16 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
                 raise RuntimeError(
                     "No generator samples for training. " "Call `train_gen()` first.",
                 )
-            gen_samples = self._gen_replay_buffer.sample(self.demo_batch_size)
-            gen_samples = types.dataclass_quick_asdict(gen_samples)
+            gen_samples_dataclass = self._gen_replay_buffer.sample(batch_size)
+            gen_samples = types.dataclass_quick_asdict(gen_samples_dataclass)
 
-        n_gen = len(gen_samples["obs"])
-        n_expert = len(expert_samples["obs"])
-        if not (n_gen == n_expert == self.demo_batch_size):
+        if not (len(gen_samples["obs"]) == len(expert_samples["obs"]) == batch_size):
             raise ValueError(
-                "Need to have exactly self.demo_batch_size number of expert and "
+                "Need to have exactly `demo_batch_size` number of expert and "
                 "generator samples, each. "
-                f"(n_gen={n_gen} n_expert={n_expert} "
-                f"demo_batch_size={self.demo_batch_size})",
+                f"(n_gen={len(gen_samples['obs'])} "
+                f"n_expert={len(expert_samples['obs'])} "
+                f"demo_batch_size={batch_size})",
             )
 
         # Guarantee that Mapping arguments are in mutable form.
@@ -531,46 +566,56 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         assert isinstance(expert_samples["obs"], np.ndarray)
 
         # Check dimensions.
-        n_samples = n_expert + n_gen
-        assert n_expert == len(expert_samples["acts"])
-        assert n_expert == len(expert_samples["next_obs"])
-        assert n_gen == len(gen_samples["acts"])
-        assert n_gen == len(gen_samples["next_obs"])
+        assert batch_size == len(expert_samples["acts"])
+        assert batch_size == len(expert_samples["next_obs"])
+        assert batch_size == len(gen_samples["acts"])
+        assert batch_size == len(gen_samples["next_obs"])
 
-        # Concatenate rollouts, and label each row as expert or generator.
-        obs = np.concatenate([expert_samples["obs"], gen_samples["obs"]])
-        acts = np.concatenate([expert_samples["acts"], gen_samples["acts"]])
-        next_obs = np.concatenate([expert_samples["next_obs"], gen_samples["next_obs"]])
-        dones = np.concatenate([expert_samples["dones"], gen_samples["dones"]])
-        # notice that the labels use the convention that expert samples are
-        # labelled with 1 and generator samples with 0.
-        labels_expert_is_one = np.concatenate(
-            [np.ones(n_expert, dtype=int), np.zeros(n_gen, dtype=int)],
-        )
+        for start in range(0, batch_size, self.demo_minibatch_size):
+            end = start + self.demo_minibatch_size
+            # take minibatch slice (this creates views so no memory issues)
+            expert_batch = {k: v[start:end] for k, v in expert_samples.items()}
+            gen_batch = {k: v[start:end] for k, v in gen_samples.items()}
 
-        # Calculate generator-policy log probabilities.
-        with th.no_grad():
-            obs_th = th.as_tensor(obs, device=self.gen_algo.device)
-            acts_th = th.as_tensor(acts, device=self.gen_algo.device)
-            log_policy_act_prob = self._get_log_policy_act_prob(obs_th, acts_th)
-            if log_policy_act_prob is not None:
-                assert len(log_policy_act_prob) == n_samples
-                log_policy_act_prob = log_policy_act_prob.reshape((n_samples,))
-            del obs_th, acts_th  # unneeded
+            # Concatenate rollouts, and label each row as expert or generator.
+            obs = np.concatenate([expert_batch["obs"], gen_batch["obs"]])
+            acts = np.concatenate([expert_batch["acts"], gen_batch["acts"]])
+            next_obs = np.concatenate([expert_batch["next_obs"], gen_batch["next_obs"]])
+            dones = np.concatenate([expert_batch["dones"], gen_batch["dones"]])
+            # notice that the labels use the convention that expert samples are
+            # labelled with 1 and generator samples with 0.
+            labels_expert_is_one = np.concatenate(
+                [
+                    np.ones(self.demo_minibatch_size, dtype=int),
+                    np.zeros(self.demo_minibatch_size, dtype=int),
+                ],
+            )
 
-        obs_th, acts_th, next_obs_th, dones_th = self.reward_train.preprocess(
-            obs,
-            acts,
-            next_obs,
-            dones,
-        )
-        batch_dict = {
-            "state": obs_th,
-            "action": acts_th,
-            "next_state": next_obs_th,
-            "done": dones_th,
-            "labels_expert_is_one": self._torchify_array(labels_expert_is_one),
-            "log_policy_act_prob": log_policy_act_prob,
-        }
+            # Calculate generator-policy log probabilities.
+            with th.no_grad():
+                obs_th = th.as_tensor(obs, device=self.gen_algo.device)
+                acts_th = th.as_tensor(acts, device=self.gen_algo.device)
+                log_policy_act_prob = self._get_log_policy_act_prob(obs_th, acts_th)
+                if log_policy_act_prob is not None:
+                    assert len(log_policy_act_prob) == 2 * self.demo_minibatch_size
+                    log_policy_act_prob = log_policy_act_prob.reshape(
+                        (2 * self.demo_minibatch_size,),
+                    )
+                del obs_th, acts_th  # unneeded
 
-        return batch_dict
+            obs_th, acts_th, next_obs_th, dones_th = self.reward_train.preprocess(
+                obs,
+                acts,
+                next_obs,
+                dones,
+            )
+            batch_dict = {
+                "state": obs_th,
+                "action": acts_th,
+                "next_state": next_obs_th,
+                "done": dones_th,
+                "labels_expert_is_one": self._torchify_array(labels_expert_is_one),
+                "log_policy_act_prob": log_policy_act_prob,
+            }
+
+            yield batch_dict
