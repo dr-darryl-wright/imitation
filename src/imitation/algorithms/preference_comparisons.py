@@ -43,6 +43,8 @@ from imitation.data.types import (
     TrajectoryWithRew,
     TrajectoryWithRewPair,
     Transitions,
+    load,
+    save,
 )
 from imitation.policies import exploration_wrapper
 from imitation.rewards import reward_function, reward_nets, reward_wrapper
@@ -239,6 +241,131 @@ class AutoPreferenceDataset(th.utils.data.Dataset):
 
     @staticmethod
     def load(path: AnyPath) -> "AutoPreferenceDataset":
+        with open(path, "rb") as file:
+            return pickle.load(file)
+
+
+class CachedPreferenceDataset(th.utils.data.Dataset):
+    """A PyTorch Dataset for loading and caching preference comparisons.
+
+    Each item is a tuple consisting of two trajectory fragments
+    and a probability that fragment 1 is preferred over fragment 2.
+
+    This dataset is maintains fragments up to `max_size` in memory and caches
+    the remaining fragments on disk. The fragments are loaded again when calling
+    `__getitem__`.
+    """
+
+    def __init__(
+        self,
+        max_size: int = 0,
+        cache_dir: AnyPath = "cached_preference_dataset",
+        seed: Optional[int] = None,
+    ):
+        """Builds an empty CachedPreferenceDataset"""
+        self.max_size = max_size
+        self.cache_dir = cache_dir
+        self.seed = seed
+
+        # TODO implement `fragments1/2`` as FIFO queues
+        # the elements that get pushed out by new ones are stored
+        # on disk and their idx and path stored in `fragments1/2_cache`
+        # `preferences` does not need to be cached as it will be a fairly
+        # small list of O(1000) floats
+        self.cache_size = 0
+        self.preferences = np.array([])
+        self.fragments1: List[TrajectoryWithRew] = []
+        self.fragments2: List[TrajectoryWithRew] = []
+
+    def push(
+        self,
+        fragments: Sequence[TrajectoryWithRewPair],
+        preferences: np.ndarray,
+    ):
+        """Add more samples to the dataset.
+
+        Args:
+            fragments: list of pairs of trajectory fragments to add
+            preferences: corresponding preference probabilities (probability
+                that fragment 1 is preferred over fragment 2)
+
+        Raises:
+            ValueError: `preferences` shape does not match `fragments` or
+                has non-float32 dtype.
+        """
+        fragments1, fragments2 = zip(*fragments)
+        if preferences.shape != (len(fragments),):
+            raise ValueError(
+                f"Unexpected preferences shape {preferences.shape}, "
+                f"expected {(len(fragments), )}",
+            )
+        if preferences.dtype != np.float32:
+            raise ValueError("preferences should have dtype float32")
+
+        self.fragments1.extend(fragments1)
+        self.fragments2.extend(fragments2)
+        self.preferences = np.concatenate((self.preferences, preferences))
+
+        # Cache old samples to disk if the dataset is at max capacity
+        if self.max_size is not None:
+            extra = len(self.preferences) - self.max_size
+            if extra > 0:
+                extra_fragments = fragments[:extra]
+                extra_preferences = self.preferences[:extra]
+                self._save_fragment_pairs(extra_fragments, extra_preferences)
+                self.fragments1 = self.fragments1[extra:]
+                self.fragments2 = self.fragments2[extra:]
+                self.preferences = self.preferences[extra:]
+
+    def _save_fragment_pairs(
+        self, fragments: Sequence[TrajectoryWithRew], preferences: np.ndarray
+    ):
+        for fragment_pair, preference in zip(fragments, preferences):
+            save_path = os.path.join(self.cache_dir, f"{{}}_{self.cache_size}.npy")
+            # don't save original observations, to save memory
+            # TODO do we need to copy the fragments?
+            for step in range(len(fragment_pair[0])):
+                if "original_obs" in fragment_pair[0].infos[step]:
+                    del fragment_pair[0].infos[step]["original_obs"]
+            for step in range(len(fragment_pair[1])):
+                if "original_obs" in fragment_pair[1].infos[step]:
+                    del fragment_pair[1].infos[step]["original_obs"]
+            save(save_path.format("fragment_pair"), fragment_pair)
+            np.save(save_path.format("preference"), np.array(preference))
+            self.cache_size += 1
+
+    def _load_fragment_pair(self, idx: int):
+        assert idx < self.cache_size
+        load_path = os.path.join(self.cache_dir, f"{{}}_{idx}.npy")
+        fragment_pair = load(load_path.format("fragment_pair"))
+        preference = np.load(load_path.format("preference"))
+        return fragment_pair, preference
+
+    def __getitem__(self, idx) -> Tuple[TrajectoryWithRewPair, float]:
+        try:
+            if idx >= self.cache_size:
+                memory_idx = idx - self.cache_size
+                first_traj = self.fragments1[memory_idx]
+                second_traj = self.fragments2[memory_idx]
+                fragment_pair = (first_traj, second_traj)
+                preference = self.preferences[memory_idx]
+            else:
+                fragment_pair, preference = self._load_fragment_pair(idx)
+        except ValueError:
+            print("Error while loading fragment pair or preference.")
+            return None
+        return fragment_pair, preference
+
+    def __len__(self) -> int:
+        assert len(self.fragments1) == len(self.fragments2)
+        return len(self.fragments1) + self.cache_size
+
+    def save(self, path: AnyPath) -> None:
+        with open(path, "wb") as file:
+            pickle.dump(self, file)
+
+    @staticmethod
+    def load(path: AnyPath) -> "CachedPreferenceDataset":
         with open(path, "rb") as file:
             return pickle.load(file)
 
@@ -792,7 +919,19 @@ class PreferenceModel(nn.Module):
             return util.safe_to_tensor(rews).to(self.model.device)
         else:
             preprocessed = self.model.preprocess(state, action, next_state, done)
-            rews = self.model(*preprocessed)
+            save_cuda_memory = True
+            if save_cuda_memory:
+                batch_size = state.shape[0]
+                fitting_size = 4
+
+                rews = th.cat(
+                    [
+                        self.model(*(preprocessed[0][i : i + fitting_size], 1, 2, 3))
+                        for i in range(0, batch_size, fitting_size)
+                    ]
+                )
+            else:
+                rews = self.model(*preprocessed)
             assert rews.shape == (len(state),)
             return rews
 
@@ -825,9 +964,7 @@ class PreferenceModel(nn.Module):
         if self.discount_factor == 1:
             returns_diff = (rews2 - rews1).sum(axis=0)
         else:
-            discounts = self.discount_factor ** th.arange(len(rews1)).to(
-                self.model.device
-            )
+            discounts = self.discount_factor ** th.arange(len(rews1)).to(rews1.device)
             if self.is_ensemble:
                 discounts = discounts.reshape(-1, 1)
             returns_diff = (discounts * (rews2 - rews1)).sum(axis=0)
@@ -1410,6 +1547,12 @@ class PrefCollectGatherer(PreferenceGatherer):
                     gathered_queries.append(query)
                     gathered_preferences.append(preference)
                 del self.pending_queries[query_id]
+            else:
+                random_preferences = True
+                if random_preferences:
+                    preference = random.choices([0.0, 1.0, 0.5])[0]
+                    gathered_queries.append(query)
+                    gathered_preferences.append(preference)
 
         return gathered_queries, np.array(gathered_preferences, dtype=np.float32)
 
@@ -1677,6 +1820,19 @@ class RewardTrainer(abc.ABC):
         """Train the reward model; see ``train`` for details."""
 
 
+def _check_memory():
+    import gc
+
+    print("[INFO] Memory check")
+    for obj in gc.get_objects():
+        try:
+            if th.is_tensor(obj) or (hasattr(obj, "data") and th.is_tensor(obj.data)):
+                print(type(obj), obj.size())
+        except:
+            pass
+    th.cuda.memory_summary()
+
+
 class BasicRewardTrainer(RewardTrainer):
     """Train a basic reward model."""
 
@@ -1733,6 +1889,7 @@ class BasicRewardTrainer(RewardTrainer):
             for fragment_pairs, preferences in tqdm(
                 dataloader, desc=f"Training epoch {ep + 1}"
             ):
+                _check_memory()
                 self.optim.zero_grad()
                 loss = self._training_inner_loop(fragment_pairs, preferences)
                 loss.backward()
@@ -2022,7 +2179,7 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         else:
             raise ValueError(f"Unknown query schedule: {query_schedule}")
 
-        self.dataset = PreferenceDataset(max_size=comparison_queue_size)
+        self.dataset = CachedPreferenceDataset(max_size=comparison_queue_size)
 
     def train(
         self,
